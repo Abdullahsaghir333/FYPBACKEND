@@ -34,12 +34,32 @@ async def create_session(file: UploadFile = File(...)) -> SessionState:
     if file.size is not None and file.size == 0:
         raise HTTPException(status_code=400, detail="Empty file uploaded.")
 
-    notes_text = await extract_text_from_upload(file)
-    # log debug info
-    print(f"create_session: extracted notes length {len(notes_text)} chars")
-    slide_dicts = await generate_slides_from_notes(notes_text)
-    scripts = await generate_scripts_for_slides(notes_text, slide_dicts)
-    print(f"create_session: generated {len(slide_dicts)} slides")
+    try:
+        notes_text = await extract_text_from_upload(file)
+        # log debug info
+        print(f"create_session: extracted notes length {len(notes_text)} chars")
+    except Exception as e:
+        print(f"create_session: extract_text_from_upload failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    try:
+        slide_dicts = await generate_slides_from_notes(notes_text)
+        print(f"create_session: slides generated ({len(slide_dicts)})")
+    except Exception as e:
+        print(f"create_session: slide generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    try:
+        scripts = await generate_scripts_for_slides(notes_text, slide_dicts)
+        print(f"create_session: scripts generated ({len(scripts)})")
+    except Exception as e:
+        print(f"create_session: script generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
     # Generate audio for scripts (parallel conversion)
     try:

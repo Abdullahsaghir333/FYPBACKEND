@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Dict
 import asyncio
 
 from google import genai
@@ -7,6 +7,9 @@ from google.genai import types
 
 # initialize client lazily
 _client: Optional[genai.Client] = None
+
+# simple in-memory cache for extractions (avoid repeated API calls on same file)
+_extraction_cache: Dict[str, str] = {}
 
 
 def get_genai_client() -> genai.Client:
@@ -24,7 +27,17 @@ async def extract_text_from_bytes(data: bytes, mime_type: str) -> str:
 
     Runs the blocking API call in a thread pool so it can be awaited from
     async endpoints.
+
+    Responses are cached by sha256(data)+mime_type key to avoid spamming the
+    API when the same file is uploaded repeatedly during development.
     """
+    import hashlib
+
+    key = hashlib.sha256(data).hexdigest() + "|" + mime_type
+    if key in _extraction_cache:
+        print(f"extract_text_from_bytes: cache hit {key[:8]}...")
+        return _extraction_cache[key]
+
     def _call() -> str:
         client = get_genai_client()
         try:
@@ -37,8 +50,11 @@ async def extract_text_from_bytes(data: bytes, mime_type: str) -> str:
             )
             return response.text
         except Exception as exc:
-            # propagate error text for troubleshooting
+            # return error string so caller can log / raise HTTP 500 with details
             return f"Extraction Error: {exc}"
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _call)
+    result = await loop.run_in_executor(None, _call)
+    _extraction_cache[key] = result
+    print(f"extract_text_from_bytes: call complete, cached key {key[:8]}...")
+    return result

@@ -1,11 +1,36 @@
 import json
 from typing import Any, Dict, List
+import hashlib
 
 from fastapi import HTTPException, UploadFile
 
 from app.core.llm import llm
 import re
 from typing import List, Dict, Any
+
+# Simple LLM response cache to avoid hitting quota limits during dev
+_llm_cache: Dict[str, str] = {}
+
+
+def _cache_key(system: str, human: str) -> str:
+    """Generate a deterministic cache key from system and human prompts."""
+    combined = f"{system}|||{human}"
+    return hashlib.md5(combined.encode()).hexdigest()
+
+
+def _llm_invoke_cached(system: str, human: str) -> str:
+    """Call LLM with caching; returns the response text."""
+    key = _cache_key(system, human)
+    if key in _llm_cache:
+        print(f"llm_invoke_cached: cache hit for key {key[:8]}...")
+        return _llm_cache[key]
+    
+    # call LLM
+    result = llm.invoke([("system", system), ("human", human)])
+    response_text = result.content if isinstance(result.content, str) else "".join(map(str, result.content))
+    _llm_cache[key] = response_text
+    print(f"llm_invoke_cached: cache miss for key {key[:8]}...; cached response")
+    return response_text
 
 
 def _parse_json_from_llm(text: str) -> Any:
@@ -29,7 +54,7 @@ async def extract_text_from_upload(file: UploadFile) -> str:
     This helper is used by the session creation flow. For plain-text files we
     simply decode the bytes; for binary formats such as PDF or images we call
     out to the Gemini extractor service to pull the text out of the document.
-    After obtaining raw text, we send it through the LLM cleanup step used
+    After obtaining raw text, we send it thro   ugh the LLM cleanup step used
     previously so that headers/footers and noise are removed.
     """
 
@@ -50,11 +75,13 @@ async def extract_text_from_upload(file: UploadFile) -> str:
         from app.services.extract_service import extract_text_from_bytes
 
         text = await extract_text_from_bytes(raw, "application/pdf")
+        print(f"extract_text_from_upload: extractor returned {len(text)} chars")
     elif content_type.startswith("image/") or any(file.filename.lower().endswith(ext) for ext in ['.png','.jpg','.jpeg','.bmp','.tiff']):
         print("extract_text_from_upload: invoking image extractor")
         from app.services.extract_service import extract_text_from_bytes
 
         text = await extract_text_from_bytes(raw, content_type or "image/jpeg")
+        print(f"extract_text_from_upload: extractor returned {len(text)} chars")
     else:
         print("extract_text_from_upload: unknown type, attempting decode")
         # fallback to naive decode hoping for plaintext
@@ -76,13 +103,7 @@ async def extract_text_from_upload(file: UploadFile) -> str:
         "Your task is to clean it up into readable study notes, removing obvious noise, headers, and footers. "
         "Return ONLY the cleaned text, no explanations or extra commentary."
     )
-    result = llm.invoke(
-        [
-            ("system", system),
-            ("human", text),
-        ]
-    )
-    cleaned = result.content if isinstance(result.content, str) else "".join(map(str, result.content))
+    cleaned = _llm_invoke_cached(system, text)
     return cleaned.strip()
 
 
@@ -101,13 +122,11 @@ async def generate_slides_from_notes(notes_text: str) -> List[Dict[str, Any]]:
         "}\n"
         "Do NOT include any explanations outside the JSON."
     )
-    result = llm.invoke(
-        [
-            ("system", system),
-            ("human", notes_text),
-        ]
-    )
-    raw = result.content if isinstance(result.content, str) else "".join(map(str, result.content))
+    try:
+        raw = _llm_invoke_cached(system, notes_text)
+    except Exception as exc:
+        # wrap and propagate to route
+        raise HTTPException(status_code=500, detail=f"Slide generation error: {exc}")
     data = _parse_json_from_llm(raw)
     slides = data.get("slides") or []
     if not isinstance(slides, list) or not slides:
@@ -128,17 +147,14 @@ async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, An
         "No text outside the JSON object."
     )
     slides_preview = json.dumps(slides, ensure_ascii=False)
-    result = llm.invoke(
-        [
-            ("system", system),
-            (
-                "human",
-                f"Here are the cleaned notes:\n\n{notes_text}\n\n"
-                f"Here is the slide structure you already proposed:\n\n{slides_preview}",
-            ),
-        ]
+    human_prompt = (
+        f"Here are the cleaned notes:\n\n{notes_text}\n\n"
+        f"Here is the slide structure you already proposed:\n\n{slides_preview}"
     )
-    raw = result.content if isinstance(result.content, str) else "".join(map(str, result.content))
+    try:
+        raw = _llm_invoke_cached(system, human_prompt)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Script generation error: {exc}")
     data = _parse_json_from_llm(raw)
     scripts = data.get("scripts") or []
     if not isinstance(scripts, list) or len(scripts) != len(slides):

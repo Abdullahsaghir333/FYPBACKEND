@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from app.core.llm import llm
 from app.models import QuestionRequest, QuestionResponse, SessionState
-from app.services.notes_pipeline import _parse_json_from_llm
+from app.services.notes_pipeline import _parse_json_from_llm, _llm_invoke_cached
 
 
 async def answer_student_question(
@@ -26,12 +26,12 @@ async def answer_student_question(
         "You are an AI teacher currently giving a lesson based on the provided notes and slides. "
         "A student has interrupted you with a question. "
         "You must:\n"
-        "1) Answer the question clearly, as if speaking.\n"
-        "2) Suggest how you would use a whiteboard to explain (short, step-by-step drawing / writing plan).\n"
+        "1) Answer the question briefly (equivalent to a 1 to 2 minute speech), using the EASIEST tone like talking to a lay person.\n"
+        "2) Provide short, strictly summarized bullet points (key points) that summarize your answer for a whiteboard display.\n"
         "Return STRICT JSON only, no extra commentary:\n"
         "{\n"
-        '  \"answer\": \"spoken-style answer\",\n'
-        '  \"whiteboard_plan\": \"short plan the UI can draw\",\n'
+        '  \"answer\": \"your spoken-style answer in a lay man tone\",\n'
+        '  \"whiteboard_plan\": \"3 to 4 extremely short bullet points\",\n'
         '  \"resume_from_slide_index\": number | null,\n'
         '  \"resume_from_point_index\": number | null\n'
         "}\n"
@@ -54,13 +54,8 @@ async def answer_student_question(
         context_parts.append("Current slide you were on:")
         context_parts.append(json.dumps(current_slide, ensure_ascii=False))
 
-    result = llm.invoke(
-        [
-            ("system", system),
-            ("human", "\n".join(context_parts)),
-        ]
-    )
-    raw = result.content if isinstance(result.content, str) else "".join(map(str, result.content))
+    human_prompt = "\n".join(context_parts)
+    raw = _llm_invoke_cached(system, human_prompt)
     data: Dict[str, Any] = _parse_json_from_llm(raw)
 
     answer = str(data.get("answer") or "").strip()
