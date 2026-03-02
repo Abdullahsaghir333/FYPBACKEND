@@ -115,7 +115,7 @@ async def generate_slides_from_notes(notes_text: str) -> List[Dict[str, Any]]:
         '  \"slides\": [\n'
         "    {\n"
         '      \"title\": \"string\",\n'
-        '      \"points\": [\"short bullet point 1\", \"short bullet point 2\", ...]\n'
+        '      \"points\": [\"point 1\", \"point 2\", \"point 3\"] // strictly 3 to 4 points max\n'
         "    },\n"
         "    ...\n"
         "  ]\n"

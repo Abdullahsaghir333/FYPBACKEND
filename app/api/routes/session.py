@@ -147,8 +147,20 @@ async def stream_slide_audio(session_id: str, slide_id: int) -> StreamingRespons
     slide = state.slides[slide_id]
     
     # Return the audio stream
+    import base64
+    async def serve_cached_audio(audio_base64: str):
+        audio_bytes = base64.b64decode(audio_base64)
+        chunk_size = 4096
+        for i in range(0, len(audio_bytes), chunk_size):
+            yield audio_bytes[i : i + chunk_size]
+
+    if slide.audio_data:
+        generator = serve_cached_audio(slide.audio_data)
+    else:
+        generator = stream_script_audio(slide.script)
+
     return StreamingResponse(
-        stream_script_audio(slide.script),
+        generator,
         media_type="audio/mpeg",
         headers={
             "Content-Disposition": f"inline; filename=slide_{slide_id}.mp3"
