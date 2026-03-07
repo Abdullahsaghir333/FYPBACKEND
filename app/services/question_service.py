@@ -26,14 +26,13 @@ async def answer_student_question(
         "You are an AI teacher currently giving a lesson based on the provided notes and slides. "
         "A student has interrupted you with a question. "
         "You must:\n"
-        "1) Answer the question briefly (equivalent to a 1 to 2 minute speech), using the EASIEST tone like talking to a lay person.\n"
-        "2) Provide short, strictly summarized bullet points (key points) that summarize your answer for a whiteboard display.\n"
+        "1) Answer the question in detail using the EASIEST tone like talking to a lay person. "
+        "The answer should be long enough for a 1-2 minute verbal explanation.\n"
+        "2) Provide 3-4 bullet points that summarize your answer for a whiteboard slide.\n"
         "Return STRICT JSON only, no extra commentary:\n"
         "{\n"
-        '  \"answer\": \"your spoken-style answer in a lay man tone\",\n'
-        '  \"whiteboard_plan\": \"3 to 4 extremely short bullet points\",\n'
-        '  \"resume_from_slide_index\": number | null,\n'
-        '  \"resume_from_point_index\": number | null\n'
+        '  "bullet_points": ["point 1", "point 2", "point 3"],\n'
+        '  "detail_ans": "your full spoken-style answer in a lay man tone (1-2 minutes worth of speech)"\n'
         "}\n"
     )
 
@@ -41,10 +40,7 @@ async def answer_student_question(
         f"Student question: {question}",
         "",
         "Original notes (excerpt):",
-        session.notes_text[:4000],
-        "",
-        "Slide deck structure:",
-        json.dumps(slides, ensure_ascii=False)[:4000],
+        session.notes_text[:1500],
         "",
         f"Current slide index: {slide_index}",
         f"Current point index: {point_index}",
@@ -58,15 +54,15 @@ async def answer_student_question(
     raw = _llm_invoke_cached(system, human_prompt)
     data: Dict[str, Any] = _parse_json_from_llm(raw)
 
-    answer = str(data.get("answer") or "").strip()
-    whiteboard_plan = str(data.get("whiteboard_plan") or "").strip()
-    resume_from_slide_index = data.get("resume_from_slide_index")
-    resume_from_point_index = data.get("resume_from_point_index")
+    bullet_points = data.get("bullet_points") or []
+    if isinstance(bullet_points, str):
+        bullet_points = [bp.strip() for bp in bullet_points.split("\n") if bp.strip()]
+    detail_ans = str(data.get("detail_ans") or "").strip()
 
     return QuestionResponse(
-        answer=answer,
-        whiteboard_plan=whiteboard_plan,
-        resume_from_slide_index=resume_from_slide_index,
-        resume_from_point_index=resume_from_point_index,
+        bullet_points=bullet_points,
+        detail_ans=detail_ans,
+        resume_from_slide_index=slide_index,
+        resume_from_point_index=point_index,
     )
 

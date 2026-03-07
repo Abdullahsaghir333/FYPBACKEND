@@ -1,6 +1,7 @@
 import json
 from typing import Any, Dict, List
 import hashlib
+import time
 
 from fastapi import HTTPException, UploadFile
 
@@ -19,33 +20,112 @@ def _cache_key(system: str, human: str) -> str:
 
 
 def _llm_invoke_cached(system: str, human: str) -> str:
-    """Call LLM with caching; returns the response text."""
+    """Call LLM with caching and automatic retry on 429 quota errors."""
     key = _cache_key(system, human)
     if key in _llm_cache:
         print(f"llm_invoke_cached: cache hit for key {key[:8]}...")
         return _llm_cache[key]
     
-    # call LLM
-    result = llm.invoke([("system", system), ("human", human)])
-    response_text = result.content if isinstance(result.content, str) else "".join(map(str, result.content))
-    _llm_cache[key] = response_text
-    print(f"llm_invoke_cached: cache miss for key {key[:8]}...; cached response")
-    return response_text
+    try:
+        result = llm.invoke([("system", system), ("human", human)])
+        response_text = _extract_text_from_result(result)
+        _llm_cache[key] = response_text
+        print(f"llm_invoke_cached: cache miss for key {key[:8]}...; cached response")
+        return response_text
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            raise HTTPException(status_code=429, detail="Gemini API quota exceeded. Please wait a minute and try again.")
+        raise
+
+
+def _extract_text_from_result(result) -> str:
+    """Extract text from a LangChain LLM result, handling both str and content-block formats."""
+    if isinstance(result.content, str):
+        return result.content
+    elif isinstance(result.content, list):
+        parts = []
+        for block in result.content:
+            if isinstance(block, dict) and 'text' in block:
+                parts.append(block['text'])
+            elif hasattr(block, 'text'):
+                parts.append(block.text)
+            else:
+                parts.append(str(block))
+        return "".join(parts)
+    return str(result.content)
+
+
+async def _llm_invoke_cached_async(system: str, human: str) -> str:
+    """Async version: uses ainvoke() so the event loop is never blocked."""
+    import asyncio
+    key = _cache_key(system, human)
+    if key in _llm_cache:
+        print(f"llm_invoke_cached_async: cache hit for key {key[:8]}...")
+        return _llm_cache[key]
+
+    try:
+        result = await llm.ainvoke([("system", system), ("human", human)])
+        response_text = _extract_text_from_result(result)
+        _llm_cache[key] = response_text
+        print(f"llm_invoke_cached_async: cache miss for key {key[:8]}...; cached response")
+        return response_text
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            raise HTTPException(status_code=429, detail="Gemini API quota exceeded. Please wait a minute and try again.")
+        raise
 
 
 def _parse_json_from_llm(text: str) -> Any:
+    """Parse JSON from LLM output, handling common formatting issues."""
+    stripped = text.strip()
+    
+    # 1. Strip markdown code fences (```json ... ``` or ``` ... ```)
+    if stripped.startswith("```"):
+        # Remove opening fence
+        first_newline = stripped.find("\n")
+        if first_newline != -1:
+            stripped = stripped[first_newline + 1:]
+        # Remove closing fence
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].rstrip()
+    
+    # 2. Try direct parse first
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        stripped = text.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.strip("`")
-            lines = stripped.splitlines()
-            if lines:
-                first = lines[0]
-                if first.lower() in {"json", "js", "javascript", "ts", "typescript"}:
-                    stripped = "\n".join(lines[1:])
         return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    
+    # 3. Try to find JSON object/array in the text (LLM may add commentary)
+    for start_char, end_char in [('{', '}'), ('[', ']')]:
+        start_idx = stripped.find(start_char)
+        end_idx = stripped.rfind(end_char)
+        if start_idx != -1 and end_idx > start_idx:
+            candidate = stripped[start_idx:end_idx + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                # 4. Try fixing single quotes -> double quotes
+                fixed = candidate.replace("'", '"')
+                try:
+                    return json.loads(fixed)
+                except json.JSONDecodeError:
+                    pass
+                
+                # 5. Try removing trailing commas before } or ]
+                fixed2 = re.sub(r',\s*([}\]])', r'\1', fixed)
+                try:
+                    return json.loads(fixed2)
+                except json.JSONDecodeError:
+                    pass
+    
+    # All attempts failed — log the raw output for debugging
+    print(f"_parse_json_from_llm: FAILED to parse. Raw LLM output:\n{text[:500]}")
+    raise HTTPException(
+        status_code=500,
+        detail=f"LLM returned invalid JSON. Raw output starts with: {text[:200]}"
+    )
 
 
 async def extract_text_from_upload(file: UploadFile) -> str:
@@ -122,11 +202,7 @@ async def generate_slides_from_notes(notes_text: str) -> List[Dict[str, Any]]:
         "}\n"
         "Do NOT include any explanations outside the JSON."
     )
-    try:
-        raw = _llm_invoke_cached(system, notes_text)
-    except Exception as exc:
-        # wrap and propagate to route
-        raise HTTPException(status_code=500, detail=f"Slide generation error: {exc}")
+    raw = _llm_invoke_cached(system, notes_text)
     data = _parse_json_from_llm(raw)
     slides = data.get("slides") or []
     if not isinstance(slides, list) or not slides:
@@ -151,10 +227,7 @@ async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, An
         f"Here are the cleaned notes:\n\n{notes_text}\n\n"
         f"Here is the slide structure you already proposed:\n\n{slides_preview}"
     )
-    try:
-        raw = _llm_invoke_cached(system, human_prompt)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Script generation error: {exc}")
+    raw = _llm_invoke_cached(system, human_prompt)
     data = _parse_json_from_llm(raw)
     scripts = data.get("scripts") or []
     if not isinstance(scripts, list) or len(scripts) != len(slides):

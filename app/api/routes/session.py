@@ -15,6 +15,7 @@ from app.services import (
     convert_scripts_to_audio,
     stream_script_audio,
     stream_script_audio_base64,
+    convert_text_to_speech,
 )
 from app.services.notes_pipeline import generate_point_timings
 from app.services.realtime import broadcast
@@ -125,6 +126,55 @@ async def ask_question(session_id: str, payload: QuestionRequest) -> QuestionRes
         pass
 
     return response
+
+
+@router.post(
+    "/{session_id}/question/audio",
+    summary="Generate sentence-chunked TTS audio for a Q&A answer",
+)
+async def stream_question_answer_audio(session_id: str, payload: dict):
+    """Split the answer into sentence groups, generate TTS in parallel, return as JSON array.
+    
+    This achieves low latency — the frontend can start playing the first chunk
+    while the backend continues generating the rest simultaneously.
+    """
+    import re
+    import base64
+    import asyncio
+
+    state = get_session(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    text = payload.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided.")
+
+    # Split into sentences, then group into chunks of 2 sentences each
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    # Group into pairs of 2 sentences for reasonable chunk size
+    chunks = []
+    for i in range(0, len(sentences), 2):
+        chunk = " ".join(sentences[i:i+2])
+        chunks.append(chunk)
+    
+    if not chunks:
+        chunks = [text]
+
+    # Generate TTS for all chunks in parallel
+    async def tts_chunk(chunk_text: str) -> str:
+        audio_bytes = await convert_text_to_speech(chunk_text)
+        return base64.b64encode(audio_bytes).decode("utf-8")
+
+    audio_chunks = await asyncio.gather(*[tts_chunk(c) for c in chunks])
+
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content={
+        "chunks": list(audio_chunks),
+        "count": len(audio_chunks),
+    })
 
 
 @router.get(

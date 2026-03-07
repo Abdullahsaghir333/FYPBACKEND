@@ -198,6 +198,33 @@ async function streamAudio(sessionId, slideId) {
 ### Pattern 3: Real-Time WebSocket
 Get chunks as they're generated, excellent for progress UI.
 
+---
+
+## Student Interruption & Q&A Workflow
+
+The front-end listens continuously with the Web Speech API and behaves like a real
+voice assistant:
+
+1. **Interrupt detection.** As soon as any speech is detected (`onspeechstart`) the
+   current slide audio is paused and the UI enters a `listening` state.
+2. **Silence buffering.** All transcripts are appended to a buffer and a 5‑second
+   timer is reset after each phrase. When the student stops speaking for 5 seconds
+   we consider the question complete and POST it to `/session/{id}/question`.
+3. **Answering.** The backend replies with an `answer` and optional
+   `resume_from_*` indices. The client speaks (or simulates) the answer, then
+   transitions to a confirmation state.
+4. **Confirmation.** After answering the user is asked “Is that clear?”. Speech is
+   monitored again; if the student says “clear” or “yes” we resume the slide audio
+   where it left off. Any other utterance during the confirming state is treated as
+   a follow‑up question (the same buffering/timeout logic applies), triggering a
+   simplified lay‑person explanation.
+5. **Fallbacks.** If no transcript arrives within ~10 seconds of entering listening
+   mode the audio automatically resumes so the session doesn’t hang.
+
+This pattern ensures natural, real‑time interaction while avoiding loops caused by
+the teacher’s own TTS being picked up by the recognizer. The script text is also
+compared to each transcript to filter out leakage.
+
 ```javascript
 const ws = new WebSocket(`ws://localhost:8000/realtime/${sessionId}/ws`);
 const chunks = [];

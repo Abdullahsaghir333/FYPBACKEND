@@ -35,8 +35,8 @@ class QuestionRequest(BaseModel):
 
 
 class QuestionResponse(BaseModel):
-    answer: str
-    whiteboard_plan: str
+    bullet_points: List[str]
+    detail_ans: str
     resume_from_slide_index: Optional[int] = None
     resume_from_point_index: Optional[int] = None
 

@@ -13,7 +13,7 @@ class Settings(BaseModel):
     app_name: str = "AI Teacher Backend"
     api_v1_prefix: str = "/api"
     gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_model: str = "gemini-3.1-flash-lite-preview"
     cors_origins: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 

@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Dict
+from typing import Optional,Dict
 import asyncio
 
 from google import genai
@@ -9,8 +9,7 @@ from google.genai import types
 _client: Optional[genai.Client] = None
 
 # simple in-memory cache for extractions (avoid repeated API calls on same file)
-_extraction_cache: Dict[str, str] = {}
-
+_extraction_cache: dict[str, str] = {}
 
 def get_genai_client() -> genai.Client:
     global _client
