@@ -1,5 +1,6 @@
 import os
-from typing import Optional,Dict
+import io
+from typing import Optional, Dict, Tuple
 import asyncio
 
 from google import genai
@@ -21,7 +22,18 @@ def get_genai_client() -> genai.Client:
     return _client
 
 
-async def extract_text_from_bytes(data: bytes, mime_type: str) -> str:
+def get_pdf_page_count(data: bytes) -> Optional[int]:
+    """Efficiently read just the PDF headers to count pages without full text extraction."""
+    try:
+        from pypdf import PdfReader
+        pdf = PdfReader(io.BytesIO(data))
+        return len(pdf.pages)
+    except Exception as e:
+        print(f"Warning: Failed to count PDF pages: {e}")
+        return None
+
+
+async def extract_text_from_bytes(data: bytes, mime_type: str) -> Tuple[str, Optional[int]]:
     """Extract text from binary data (PDF, image, etc.) using Gemini.
 
     Runs the blocking API call in a thread pool so it can be awaited from
@@ -52,8 +64,13 @@ async def extract_text_from_bytes(data: bytes, mime_type: str) -> str:
             # return error string so caller can log / raise HTTP 500 with details
             return f"Extraction Error: {exc}"
 
+    # Attempt to get page count if it is a PDF
+    page_count = None
+    if mime_type == "application/pdf":
+        page_count = get_pdf_page_count(data)
+
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _call)
     _extraction_cache[key] = result
     print(f"extract_text_from_bytes: call complete, cached key {key[:8]}...")
-    return result
+    return result, page_count

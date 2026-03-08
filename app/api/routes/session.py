@@ -1,7 +1,7 @@
 import uuid
-from typing import List
+from typing import List, Dict, Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile, BackgroundTasks
 from fastapi.responses import StreamingResponse
 
 from app.models import QuestionRequest, QuestionResponse, SessionState, Slide, SlidePoint
@@ -27,25 +27,53 @@ from app.services.realtime import (
 import asyncio
 
 
+async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slide_dicts: List[Dict[str, Any]]):
+    """Background task to generate scripts for slides > 6."""
+    state = get_session(session_id)
+    if not state:
+        return
+        
+    chunk_size = 6
+    for i in range(chunk_size, len(all_slide_dicts), chunk_size):
+        chunk = all_slide_dicts[i : i + chunk_size]
+        try:
+            print(f"Background: generating scripts for slides {i} to {i+len(chunk)-1}...")
+            chunk_scripts = await generate_scripts_for_slides(notes_text, chunk)
+            
+            # Update the session state slides
+            for j, script in enumerate(chunk_scripts):
+                slide_idx = i + j
+                if slide_idx < len(state.slides):
+                    # add the script and timings
+                    state.slides[slide_idx].script = script.strip()
+                    raw_points = all_slide_dicts[slide_idx].get("points") or []
+                    from app.services.notes_pipeline import generate_point_timings
+                    state.slides[slide_idx].point_timings = generate_point_timings(script.strip(), raw_points)
+                    
+            save_session(state)
+        except Exception as e:
+            print(f"Background script generation failed at chunk {i}: {e}")
+            break
+
 router = APIRouter()
 
 
 @router.post("", response_model=SessionState, summary="Create a new teaching session from uploaded notes")
-async def create_session(file: UploadFile = File(...)) -> SessionState:
+async def create_session(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> SessionState:
     if file.size is not None and file.size == 0:
         raise HTTPException(status_code=400, detail="Empty file uploaded.")
 
     try:
-        notes_text = await extract_text_from_upload(file)
+        notes_text, page_count = await extract_text_from_upload(file)
         # log debug info
-        print(f"create_session: extracted notes length {len(notes_text)} chars")
+        print(f"create_session: extracted notes length {len(notes_text)} chars, pages={page_count}")
     except Exception as e:
         print(f"create_session: extract_text_from_upload failed: {e}")
         import traceback
         traceback.print_exc()
         raise
     try:
-        slide_dicts = await generate_slides_from_notes(notes_text)
+        slide_dicts = await generate_slides_from_notes(notes_text, page_count)
         print(f"create_session: slides generated ({len(slide_dicts)})")
     except Exception as e:
         print(f"create_session: slide generation failed: {e}")
@@ -53,48 +81,53 @@ async def create_session(file: UploadFile = File(...)) -> SessionState:
         traceback.print_exc()
         raise
 
+    # Only generate scripts for the first chunk to return instantly
+    chunk_size = 6
+    first_chunk_dicts = slide_dicts[:chunk_size]
+
     try:
-        scripts = await generate_scripts_for_slides(notes_text, slide_dicts)
-        print(f"create_session: scripts generated ({len(scripts)})")
+        first_scripts = await generate_scripts_for_slides(notes_text, first_chunk_dicts)
+        print(f"create_session: initial scripts generated ({len(first_scripts)})")
     except Exception as e:
-        print(f"create_session: script generation failed: {e}")
+        print(f"create_session: initial script generation failed: {e}")
         import traceback
         traceback.print_exc()
         raise
 
-    # Generate audio for scripts (parallel conversion)
-    try:
-        audio_results = await convert_scripts_to_audio(scripts)
-        audio_map = {ar["script_index"]: ar for ar in audio_results}
-    except Exception as e:
-        # If audio generation fails, continue without audio but log the error
-        print(f"Warning: Failed to generate audio: {e}")
-        audio_map = {}
+    # Pad the rest with empty scripts temporarily
+    scripts = list(first_scripts)
+    while len(scripts) < len(slide_dicts):
+        scripts.append("")
 
     slides: List[Slide] = []
     for idx, (s, script) in enumerate(zip(slide_dicts, scripts), start=0):
         title = s.get("title") or f"Slide {idx + 1}"
         raw_points = s.get("points") or []
         points = [SlidePoint(text=str(p)) for p in raw_points if str(p).strip()]
-        # generate approximate timings for each point so frontend can highlight
-        timings = generate_point_timings(script.strip(), raw_points)
         
-        # Get audio data if available
-        audio_data = audio_map.get(idx)
+        # approximate timings can only be calculated for scripts we actually have
+        timings = generate_point_timings(script.strip(), raw_points) if script.strip() else []
+        
+        # Audio is completely on-demand now! No more pre-generation delay here.
         slide = Slide(
             id=idx,
             title=title,
             points=points,
             script=script.strip(),
             point_timings=timings,
-            audio_data=audio_data.get("audio_data") if audio_data else None,
-            audio_chunks=audio_data.get("audio_chunks") if audio_data else None,
+            audio_data=None,
+            audio_chunks=None,
         )
         slides.append(slide)
 
     session_id = str(uuid.uuid4())
     state = SessionState(id=session_id, notes_text=notes_text, slides=slides)
     save_session(state)
+
+    # If there are more slides than the first chunk, launch the background task
+    if len(slide_dicts) > chunk_size:
+        background_tasks.add_task(_generate_remaining_scripts, session_id, notes_text, slide_dicts)
+
     return state
 
 
@@ -195,7 +228,23 @@ async def stream_slide_audio(session_id: str, slide_id: int) -> StreamingRespons
         raise HTTPException(status_code=404, detail="Slide not found.")
     
     slide = state.slides[slide_id]
+    import asyncio
     
+    # Wait for the background task to generate the script if it's not ready yet
+    max_retries = 30
+    retries = 0
+    while not slide.script and retries < max_retries:
+        await asyncio.sleep(1.0)
+        # re-fetch state to get the latest
+        state = get_session(session_id)
+        if not state:
+            raise HTTPException(status_code=404, detail="Session disappeared.")
+        slide = state.slides[slide_id]
+        retries += 1
+        
+    if not slide.script:
+        raise HTTPException(status_code=408, detail="Timeout waiting for slide script generation.")
+
     # Return the audio stream
     import base64
     async def serve_cached_audio(audio_base64: str):
@@ -207,7 +256,15 @@ async def stream_slide_audio(session_id: str, slide_id: int) -> StreamingRespons
     if slide.audio_data:
         generator = serve_cached_audio(slide.audio_data)
     else:
-        generator = stream_script_audio(slide.script)
+        # Generate on the fly, cache it, then serve
+        try:
+            audio_bytes = await convert_text_to_speech(slide.script)
+            slide.audio_data = base64.b64encode(audio_bytes).decode("utf-8")
+            save_session(state)
+            generator = serve_cached_audio(slide.audio_data)
+        except Exception as e:
+            print(f"Failed to generate audio on-the-fly: {e}")
+            raise HTTPException(status_code=500, detail="TTS generation failed")
 
     return StreamingResponse(
         generator,

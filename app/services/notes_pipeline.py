@@ -128,8 +128,10 @@ def _parse_json_from_llm(text: str) -> Any:
     )
 
 
-async def extract_text_from_upload(file: UploadFile) -> str:
-    """Read an uploaded file and return cleaned text.
+from typing import Tuple, Optional
+
+async def extract_text_from_upload(file: UploadFile) -> Tuple[str, Optional[int]]:
+    """Read an uploaded file and return cleaned text and optional page count.
 
     This helper is used by the session creation flow. For plain-text files we
     simply decode the bytes; for binary formats such as PDF or images we call
@@ -142,6 +144,7 @@ async def extract_text_from_upload(file: UploadFile) -> str:
 
     # determine whether we need to run extraction
     text = ""
+    page_count = None
     content_type = file.content_type or ""
     print(f"extract_text_from_upload: received file '{file.filename}' content_type={content_type} size={len(raw)}")
     if content_type.startswith("text/") or file.filename.lower().endswith(".txt"):
@@ -154,14 +157,16 @@ async def extract_text_from_upload(file: UploadFile) -> str:
         print("extract_text_from_upload: invoking PDF extractor")
         from app.services.extract_service import extract_text_from_bytes
 
-        text = await extract_text_from_bytes(raw, "application/pdf")
-        print(f"extract_text_from_upload: extractor returned {len(text)} chars")
+        text, page_count = await extract_text_from_bytes(raw, "application/pdf")
+        print(f"extract_text_from_upload: extractor returned {len(text)} chars, pages={page_count}")
+        print(f"--- EXTRACTED PDF TEXT PREVIEW ---\n{text[:1000]}\n----------------------------------")
     elif content_type.startswith("image/") or any(file.filename.lower().endswith(ext) for ext in ['.png','.jpg','.jpeg','.bmp','.tiff']):
         print("extract_text_from_upload: invoking image extractor")
         from app.services.extract_service import extract_text_from_bytes
 
-        text = await extract_text_from_bytes(raw, content_type or "image/jpeg")
+        text, _ = await extract_text_from_bytes(raw, content_type or "image/jpeg")    
         print(f"extract_text_from_upload: extractor returned {len(text)} chars")
+        print(f"--- EXTRACTED IMAGE TEXT PREVIEW ---\n{text[:1000]}\n------------------------------------")
     else:
         print("extract_text_from_upload: unknown type, attempting decode")
         # fallback to naive decode hoping for plaintext
@@ -184,18 +189,23 @@ async def extract_text_from_upload(file: UploadFile) -> str:
         "Return ONLY the cleaned text, no explanations or extra commentary."
     )
     cleaned = _llm_invoke_cached(system, text)
-    return cleaned.strip()
+    return cleaned.strip(), page_count
 
 
-async def generate_slides_from_notes(notes_text: str) -> List[Dict[str, Any]]:
+async def generate_slides_from_notes(notes_text: str, page_count: Optional[int] = None) -> List[Dict[str, Any]]:
+    page_instruction = ""
+    if page_count is not None and page_count > 3:
+        page_instruction = f"IMPORTANT: The original document has exactly {page_count} pages. You MUST generate EXACTLY {page_count} slides (one main slide representing each page's core concept).\n"
+
     system = (
         "You are an expert teacher. Given the student's notes, design a concise slide deck.\n"
+        f"{page_instruction}"
         "Return STRICT JSON with this exact shape:\n"
         "{\n"
         '  \"slides\": [\n'
         "    {\n"
         '      \"title\": \"string\",\n'
-        '      \"points\": [\"point 1\", \"point 2\", \"point 3\"] // strictly 3 to 4 points max\n'
+        '      \"points\": [\"point 1\", \"point 2\", \"point 3\", \"point 4\", \"...\"] // Extract ALL key points from the source material for this slide. Do not limit to just 3-4 points if the source material has more points.\n'
         "    },\n"
         "    ...\n"
         "  ]\n"
@@ -214,6 +224,8 @@ async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, An
     system = (
         "You are an experienced teacher giving a spoken explanation.\n"
         "For each slide, produce a short script (max ~200 words) that a teacher would say while presenting it.\n"
+        "The scripts should be concise and to the point.\n"
+        "Follow a teacher style  explaining in layman language and use simple examples.\n"
         "Use approachable language, examples, and small checkpoints like “pause and think for a second”.\n"
         "Return STRICT JSON with this exact structure:\n"
         "{\n"
