@@ -36,24 +36,30 @@ async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slid
     chunk_size = 6
     for i in range(chunk_size, len(all_slide_dicts), chunk_size):
         chunk = all_slide_dicts[i : i + chunk_size]
-        try:
-            print(f"Background: generating scripts for slides {i} to {i+len(chunk)-1}...")
-            chunk_scripts = await generate_scripts_for_slides(notes_text, chunk)
-            
-            # Update the session state slides
-            for j, script in enumerate(chunk_scripts):
-                slide_idx = i + j
-                if slide_idx < len(state.slides):
-                    # add the script and timings
-                    state.slides[slide_idx].script = script.strip()
-                    raw_points = all_slide_dicts[slide_idx].get("points") or []
-                    from app.services.notes_pipeline import generate_point_timings
-                    state.slides[slide_idx].point_timings = generate_point_timings(script.strip(), raw_points)
-                    
-            save_session(state)
-        except Exception as e:
-            print(f"Background script generation failed at chunk {i}: {e}")
-            break
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Background: generating scripts for slides {i} to {i+len(chunk)-1} (Attempt {attempt+1}/{max_retries})...")
+                chunk_scripts = await generate_scripts_for_slides(notes_text, chunk)
+                
+                # Update the session state slides
+                for j, script in enumerate(chunk_scripts):
+                    slide_idx = i + j
+                    if slide_idx < len(state.slides):
+                        # add the script and timings
+                        state.slides[slide_idx].script = script.strip()
+                        raw_points = all_slide_dicts[slide_idx].get("points") or []
+                        from app.services.notes_pipeline import generate_point_timings
+                        state.slides[slide_idx].point_timings = generate_point_timings(script.strip(), raw_points)
+                        
+                save_session(state)
+                break  # success, break the retry loop
+            except Exception as e:
+                print(f"Background script generation failed at chunk {i} on attempt {attempt+1}: {e}")
+                if attempt == max_retries - 1:
+                    print("Max retries reached. Skipping this chunk.")
+                else:
+                    await asyncio.sleep(2)
 
 router = APIRouter()
 

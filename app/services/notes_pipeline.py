@@ -231,7 +231,8 @@ async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, An
         "{\n"
         '  \"scripts\": [\"script for slide 1\", \"script for slide 2\", ...]\n'
         "}\n"
-        "The number of scripts must exactly match the number of slides.\n"
+        f"IMPORTANT: You are generating scripts for a batch of EXACTLY {len(slides)} slides.\n"
+        f"Your JSON array MUST contain EXACTLY {len(sl5ides)} strings, one for each slide provided.\n"
         "No text outside the JSON object."
     )
     slides_preview = json.dumps(slides, ensure_ascii=False)
