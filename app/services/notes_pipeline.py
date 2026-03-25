@@ -20,23 +20,32 @@ def _cache_key(system: str, human: str) -> str:
 
 
 def _llm_invoke_cached(system: str, human: str) -> str:
-    """Call LLM with caching and automatic retry on 429 quota errors."""
+    """Call LLM with caching and automatic retry on 429/503 quota errors."""
     key = _cache_key(system, human)
     if key in _llm_cache:
         print(f"llm_invoke_cached: cache hit for key {key[:8]}...")
         return _llm_cache[key]
     
-    try:
-        result = llm.invoke([("system", system), ("human", human)])
-        response_text = _extract_text_from_result(result)
-        _llm_cache[key] = response_text
-        print(f"llm_invoke_cached: cache miss for key {key[:8]}...; cached response")
-        return response_text
-    except Exception as e:
-        err_str = str(e)
-        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-            raise HTTPException(status_code=429, detail="Gemini API quota exceeded. Please wait a minute and try again.")
-        raise
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = llm.invoke([("system", system), ("human", human)])
+            response_text = _extract_text_from_result(result)
+            _llm_cache[key] = response_text
+            print(f"llm_invoke_cached: cache miss for key {key[:8]}...; cached response")
+            return response_text
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str
+            if is_retryable:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt * 2 # 2s, 4s
+                    print(f"llm_invoke_cached: API busy (attempt {attempt+1}/{max_retries}). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise HTTPException(status_code=503, detail="Gemini API is currently busy or quota exceeded. Please wait a moment and try again.")
+            raise
 
 
 def _extract_text_from_result(result) -> str:
@@ -64,17 +73,26 @@ async def _llm_invoke_cached_async(system: str, human: str) -> str:
         print(f"llm_invoke_cached_async: cache hit for key {key[:8]}...")
         return _llm_cache[key]
 
-    try:
-        result = await llm.ainvoke([("system", system), ("human", human)])
-        response_text = _extract_text_from_result(result)
-        _llm_cache[key] = response_text
-        print(f"llm_invoke_cached_async: cache miss for key {key[:8]}...; cached response")
-        return response_text
-    except Exception as e:
-        err_str = str(e)
-        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-            raise HTTPException(status_code=429, detail="Gemini API quota exceeded. Please wait a minute and try again.")
-        raise
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = await llm.ainvoke([("system", system), ("human", human)])
+            response_text = _extract_text_from_result(result)
+            _llm_cache[key] = response_text
+            print(f"llm_invoke_cached_async: cache miss for key {key[:8]}...; cached response")
+            return response_text
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str
+            if is_retryable:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt * 2 # 2s, 4s
+                    print(f"llm_invoke_cached_async: API busy (attempt {attempt+1}/{max_retries}). Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    raise HTTPException(status_code=503, detail="Gemini API is currently busy or quota exceeded. Please wait a moment and try again.")
+            raise
 
 
 def _parse_json_from_llm(text: str) -> Any:
@@ -188,7 +206,7 @@ async def extract_text_from_upload(file: UploadFile) -> Tuple[str, Optional[int]
         "Your task is to clean it up into readable study notes, removing obvious noise, headers, and footers. "
         "Return ONLY the cleaned text, no explanations or extra commentary."
     )
-    cleaned = _llm_invoke_cached(system, text)
+    cleaned = await _llm_invoke_cached_async(system, text)
     return cleaned.strip(), page_count
 
 
@@ -212,7 +230,7 @@ async def generate_slides_from_notes(notes_text: str, page_count: Optional[int] 
         "}\n"
         "Do NOT include any explanations outside the JSON."
     )
-    raw = _llm_invoke_cached(system, notes_text)
+    raw = await _llm_invoke_cached_async(system, notes_text)
     data = _parse_json_from_llm(raw)
     slides = data.get("slides") or []
     if not isinstance(slides, list) or not slides:
@@ -240,7 +258,7 @@ async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, An
         f"Here are the cleaned notes:\n\n{notes_text}\n\n"
         f"Here is the slide structure you already proposed:\n\n{slides_preview}"
     )
-    raw = _llm_invoke_cached(system, human_prompt)
+    raw = await _llm_invoke_cached_async(system, human_prompt)
     data = _parse_json_from_llm(raw)
     scripts = data.get("scripts") or []
     if not isinstance(scripts, list) or len(scripts) != len(slides):

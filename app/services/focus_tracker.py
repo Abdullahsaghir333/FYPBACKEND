@@ -13,8 +13,8 @@ class FocusTracker:
         self.EAR_DROP_THRESH = 0.04
         self.BLINK_THRESHOLD = 15.0
         self.SLEEP_LIMIT = 15.0
-        # Increased threshold to ignore camera noise/iris jitter
-        self.GAZE_MOVE_THRESH = 0.2  
+        # Sensitivity for eye movement (Lower = easier to detect reading)
+        self.GAZE_MOVE_THRESH = 0.005
 
         # ── Weights ──
         self.W_POSE = 0.4
@@ -155,8 +155,23 @@ class FocusTracker:
             delta_yaw = abs(yaw - self.baseline_yaw)
             delta_ear = self.baseline_ear - ear
 
-            pose_score = 1.0 if (delta_pitch < self.PITCH_TOLERANCE and delta_yaw < self.YAW_TOLERANCE) else 0.0
-            eye_score = 1.0 if delta_ear < self.EAR_DROP_THRESH else 0.0
+            # A. Head Pose Score
+            if delta_pitch < self.PITCH_TOLERANCE and delta_yaw < self.YAW_TOLERANCE:
+                pose_score = 1.0
+            elif delta_pitch < self.PITCH_TOLERANCE*1.5 and delta_yaw < self.YAW_TOLERANCE*1.5:
+                pose_score = 0.5
+            else:
+                pose_score = 0.0
+
+            # B. Eye Openness Score
+            if delta_ear < self.EAR_DROP_THRESH: 
+                eye_score = 1.0 
+            elif delta_ear < self.EAR_DROP_THRESH + 0.05: 
+                eye_score = 0.5 
+            else: 
+                eye_score = 0.0 
+
+            # C. Combine Initial Focus Value
             focus_val = (pose_score * self.W_POSE) + (eye_score * self.W_EYES) + (gaze_score * self.W_GAZE)
 
             # 4. Sleep Logic (> 15s)

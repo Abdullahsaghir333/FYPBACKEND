@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from app.core.llm import llm
 from app.models import QuestionRequest, QuestionResponse, SessionState
-from app.services.notes_pipeline import _parse_json_from_llm, _llm_invoke_cached
+from app.services.notes_pipeline import _parse_json_from_llm, _llm_invoke_cached_async
 
 
 async def answer_student_question(
@@ -51,7 +51,7 @@ async def answer_student_question(
         context_parts.append(json.dumps(current_slide, ensure_ascii=False))
 
     human_prompt = "\n".join(context_parts)
-    raw = _llm_invoke_cached(system, human_prompt)
+    raw = await _llm_invoke_cached_async(system, human_prompt)
     data: Dict[str, Any] = _parse_json_from_llm(raw)
 
     bullet_points = data.get("bullet_points") or []
