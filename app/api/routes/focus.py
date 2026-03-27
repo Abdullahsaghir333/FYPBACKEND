@@ -30,7 +30,8 @@ async def focus_ws(session_id: str, websocket: WebSocket):
                 await websocket.send_json({"status": "RECALIBRATING"})
                 continue
                 
-            frame_base64 = message.get("frame")
+            # Accept both `frame` (preferred) and `image` (legacy) keys from the client.
+            frame_base64 = message.get("frame") or message.get("image")
             if not frame_base64:
                 continue
             

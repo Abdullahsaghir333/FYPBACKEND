@@ -10,7 +10,7 @@ from google.genai import types
 _client: Optional[genai.Client] = None
 
 # simple in-memory cache for extractions (avoid repeated API calls on same file)
-_extraction_cache: dict[str, str] = {}
+_extraction_cache: dict[str, Tuple[str, Optional[int]]] = {}
 
 def get_genai_client() -> genai.Client:
     global _client
@@ -71,6 +71,6 @@ async def extract_text_from_bytes(data: bytes, mime_type: str) -> Tuple[str, Opt
 
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _call)
-    _extraction_cache[key] = result
+    _extraction_cache[key] = (result, page_count)
     print(f"extract_text_from_bytes: call complete, cached key {key[:8]}...")
     return result, page_count

@@ -36,7 +36,7 @@ async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slid
     chunk_size = 6
     for i in range(chunk_size, len(all_slide_dicts), chunk_size):
         chunk = all_slide_dicts[i : i + chunk_size]
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 print(f"Background: generating scripts for slides {i} to {i+len(chunk)-1} (Attempt {attempt+1}/{max_retries})...")
@@ -59,7 +59,7 @@ async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slid
                 if attempt == max_retries - 1:
                     print("Max retries reached. Skipping this chunk.")
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(2 ** attempt * 2)
 
 router = APIRouter()
 
@@ -95,10 +95,9 @@ async def create_session(background_tasks: BackgroundTasks, file: UploadFile = F
         first_scripts = await generate_scripts_for_slides(notes_text, first_chunk_dicts)
         print(f"create_session: initial scripts generated ({len(first_scripts)})")
     except Exception as e:
-        print(f"create_session: initial script generation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+        # Do not fail entire session on transient Gemini load spikes.
+        print(f"create_session: initial script generation failed (fallback to empty scripts): {e}")
+        first_scripts = ["" for _ in first_chunk_dicts]
 
     # Pad the rest with empty scripts temporarily
     scripts = list(first_scripts)
@@ -143,6 +142,32 @@ async def get_session_state(session_id: str) -> SessionState:
     if not state:
         raise HTTPException(status_code=404, detail="Session not found.")
     return state
+
+
+@router.get("/{session_id}/deck", summary="Stream the visual slide deck (PDF)")
+async def stream_deck_pdf(session_id: str) -> StreamingResponse:
+    """Stream the Pluslide-exported PDF deck via backend to avoid CORS issues."""
+    state = get_session(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if not state.deck_url or state.deck_format != "pdf":
+        raise HTTPException(status_code=404, detail="Deck not ready.")
+
+    import httpx
+
+    async def _proxy():
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            async with client.stream("GET", state.deck_url) as resp:
+                if not resp.is_success:
+                    raise HTTPException(status_code=502, detail=f"Failed to fetch deck: {resp.status_code}")
+                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                    yield chunk
+
+    return StreamingResponse(
+        _proxy(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="deck.pdf"'},
+    )
 
 
 @router.post(

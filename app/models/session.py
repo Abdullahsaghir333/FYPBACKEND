@@ -26,6 +26,11 @@ class SessionState(BaseModel):
     id: str
     notes_text: str
     slides: List[Slide]
+    # Session lifecycle metadata (optional for backwards compatibility)
+    status: Optional[str] = None  # "processing" | "ready" | "error"
+    error: Optional[str] = None
+    total_slides: Optional[int] = None
+    ready_slides: Optional[int] = None
 
 
 class QuestionRequest(BaseModel):

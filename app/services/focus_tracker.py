@@ -4,217 +4,275 @@ import numpy as np
 import time
 from collections import deque
 
+
 class FocusTracker:
+    # ── Thresholds ────────────────────────────────────────────────────────
+    PITCH_TOLERANCE      = 25.0
+    HEAD_DOWN_THRESH     = 45.0
+    YAW_TOLERANCE        = 20.0
+    EAR_BLINK_THRESH     = 0.03   # EAR drop that counts as a physical blink
+    EAR_DROP_THRESH      = 0.04   # EAR drop used for eye-openness scoring
+    SLEEP_LIMIT          = 15.0   # seconds with eyes closed -> alarm
+    HEAD_DOWN_LIMIT      = 15.0   # seconds with head down -> alarm
+    GAZE_MOVE_THRESH     = 0.005  # gaze-variance threshold (scaled x10000)
+
+    # Stare alarm fires only when BOTH timers exceed their limit simultaneously
+    BLINK_THRESHOLD      = 15.0   # seconds since last physical blink
+    GAZE_STILL_THRESHOLD = 15.0   # seconds since last meaningful iris movement
+
+    # ── Score weights ─────────────────────────────────────────────────────
+    W_POSE = 0.4
+    W_EYES = 0.3
+    W_GAZE = 0.3
+
+    # ── Calibration: 30 frames ~ 10 s at ~3 fps over the WebSocket ───────
+    MAX_CALIB_FRAMES = 30
+
+    # ── Eye landmark indices ──────────────────────────────────────────────
+    LEFT_EYE  = [33,  160, 158, 133, 153, 144]
+    RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
     def __init__(self):
-        # ── Thresholds ──
-        self.PITCH_TOLERANCE = 25.0
-        self.HEAD_DOWN_THRESH = 45.0
-        self.YAW_TOLERANCE = 20.0
-        self.EAR_DROP_THRESH = 0.04
-        self.BLINK_THRESHOLD = 15.0
-        self.SLEEP_LIMIT = 15.0
-        # Sensitivity for eye movement (Lower = easier to detect reading)
-        self.GAZE_MOVE_THRESH = 0.005
-
-        # ── Weights ──
-        self.W_POSE = 0.4
-        self.W_EYES = 0.3
-        self.W_GAZE = 0.3
-
-        # ── MediaPipe Face Mesh ──
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
         )
+        self._reset_state()
 
-        # ── Eye landmark indices ──
-        self.LEFT_EYE = [33, 160, 158, 133, 153, 144]
-        self.RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-
-        # ── Calibration state ──
-        self.is_calibrated = False
+    def _reset_state(self):
+        self.is_calibrated      = False
         self.calibration_frames = 0
-        self.MAX_CALIB_FRAMES = 100
-        self.baseline_pitch = 0
-        self.baseline_yaw = 0
-        self.baseline_ear = 0
+        self._calib_pitch_sum   = 0.0
+        self._calib_yaw_sum     = 0.0
+        self._calib_ear_sum     = 0.0
+        self.baseline_pitch     = 0.0
+        self.baseline_yaw       = 0.0
+        self.baseline_ear       = 0.0
 
-        # ── Tracking state ──
-        self.last_blink_time = time.time()
+        # Two independent timers
+        self.last_blink_time     = time.time()
+        self.last_gaze_move_time = time.time()
+
         self.focus_history = deque(maxlen=20)
-        self.gaze_history = deque(maxlen=30)
-        self.head_down_start_time = None
+        self.gaze_history  = deque(maxlen=30)
+
+        self.head_down_start_time   = None
         self.eyes_closed_start_time = None
 
-    def get_head_pose(self, landmarks, img_w, img_h):
+    # ── Geometry helpers ──────────────────────────────────────────────────
+
+    def _get_head_pose(self, landmarks, img_w, img_h):
         face_3d = np.array([
-            [0.0, 0.0, 0.0],
-            [0.0, 330.0, -65.0],
+            [  0.0,   0.0,    0.0],
+            [  0.0, 330.0,  -65.0],
             [-225.0, -170.0, -135.0],
-            [225.0, -170.0, -135.0],
-            [-150.0, 150.0, -125.0],
-            [150.0, 150.0, -125.0]
+            [ 225.0, -170.0, -135.0],
+            [-150.0,  150.0, -125.0],
+            [ 150.0,  150.0, -125.0],
         ], dtype=np.float64)
-
-        face_2d = []
-        for idx in [1, 152, 33, 263, 61, 291]:
-            lm = landmarks[idx]
-            face_2d.append([lm.x * img_w, lm.y * img_h])
-        face_2d = np.array(face_2d, dtype=np.float64)
-
-        focal_length = 1 * img_w
+        face_2d = np.array(
+            [[landmarks[i].x * img_w, landmarks[i].y * img_h]
+             for i in [1, 152, 33, 263, 61, 291]],
+            dtype=np.float64,
+        )
+        focal_length = img_w
         cam_matrix = np.array([
-            [focal_length, 0, img_h / 2],
-            [0, focal_length, img_w / 2],
-            [0, 0, 1]
+            [focal_length, 0,            img_h / 2],
+            [0,            focal_length, img_w / 2],
+            [0,            0,            1         ],
         ])
         dist_coeffs = np.zeros((4, 1))
-
-        success, rot_vec, trans_vec = cv2.solvePnP(face_3d, face_2d, cam_matrix, dist_coeffs)
-        rmat, _ = cv2.Rodrigues(rot_vec)
-        angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
-
+        _, rot_vec, _ = cv2.solvePnP(face_3d, face_2d, cam_matrix, dist_coeffs)
+        rmat, _       = cv2.Rodrigues(rot_vec)
+        angles, *_    = cv2.RQDecomp3x3(rmat)
         return angles[0], angles[1], angles[2]
 
-    def calculate_ear(self, landmarks, indices):
-        v1 = np.linalg.norm(np.array([landmarks[indices[1]].x, landmarks[indices[1]].y]) -
-                            np.array([landmarks[indices[5]].x, landmarks[indices[5]].y]))
-        v2 = np.linalg.norm(np.array([landmarks[indices[2]].x, landmarks[indices[2]].y]) -
-                            np.array([landmarks[indices[4]].x, landmarks[indices[4]].y]))
-        h = np.linalg.norm(np.array([landmarks[indices[0]].x, landmarks[indices[0]].y]) -
-                           np.array([landmarks[indices[3]].x, landmarks[indices[3]].y]))
-        return (v1 + v2) / (2.0 * h)
+    def _calculate_ear(self, landmarks, indices):
+        pts = np.array([[landmarks[i].x, landmarks[i].y] for i in indices])
+        v1 = np.linalg.norm(pts[1] - pts[5])
+        v2 = np.linalg.norm(pts[2] - pts[4])
+        h  = np.linalg.norm(pts[0] - pts[3])
+        return (v1 + v2) / (2.0 * h) if h > 0 else 0.0
 
-    def get_gaze_score(self, landmarks):
-        L_iris = landmarks[468].x
-        L_center = (landmarks[33].x + landmarks[133].x) / 2
-        R_iris = landmarks[473].x
+    def _get_iris_gaze_score(self, landmarks):
+        L_iris   = landmarks[468].x
+        L_center = (landmarks[33].x  + landmarks[133].x) / 2
+        R_iris   = landmarks[473].x
         R_center = (landmarks[362].x + landmarks[263].x) / 2
-        
         avg_dist = (abs(L_iris - L_center) + abs(R_iris - R_center)) / 2
-        if avg_dist < 0.004: return 1.0
+        if avg_dist < 0.004:   return 1.0
         elif avg_dist < 0.008: return 0.5
-        else: return 0.0
+        else:                  return 0.0
 
-    def process_frame(self, frame):
-        h, w, c = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # ── Public entry point ────────────────────────────────────────────────
+
+    def process_frame(self, frame: np.ndarray) -> dict:
+        h, w, _ = frame.shape
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
+        if not results.multi_face_landmarks:
+            return self._no_face_result()
+        lm = results.multi_face_landmarks[0].landmark
+        return self._calibrate(lm, w, h) if not self.is_calibrated else self._monitor(lm, w, h)
 
-        focus_val = 0.0
-        status = "NOT FOCUSED"
-        alert_text = None
-        alarm_trigger = False
+    # ── Calibration ───────────────────────────────────────────────────────
 
-        if results.multi_face_landmarks:
-            lm = results.multi_face_landmarks[0].landmark
-            pitch, yaw, roll = self.get_head_pose(lm, w, h)
-            ear = (self.calculate_ear(lm, self.LEFT_EYE) + self.calculate_ear(lm, self.RIGHT_EYE)) / 2.0
-            gaze_score = self.get_gaze_score(lm)
+    def _calibrate(self, lm, w, h) -> dict:
+        pitch, yaw, _ = self._get_head_pose(lm, w, h)
+        ear = (self._calculate_ear(lm, self.LEFT_EYE) +
+               self._calculate_ear(lm, self.RIGHT_EYE)) / 2.0
 
-            if not self.is_calibrated:
-                self.calibration_frames += 1
-                self.baseline_pitch += pitch
-                self.baseline_yaw += yaw
-                self.baseline_ear += ear
+        self.calibration_frames  += 1
+        self._calib_pitch_sum    += pitch
+        self._calib_yaw_sum      += yaw
+        self._calib_ear_sum      += ear
 
-                if self.calibration_frames >= self.MAX_CALIB_FRAMES:
-                    self.baseline_pitch /= self.MAX_CALIB_FRAMES
-                    self.baseline_yaw /= self.MAX_CALIB_FRAMES
-                    self.baseline_ear /= self.MAX_CALIB_FRAMES
-                    self.is_calibrated = True
-                    self.last_blink_time = time.time()
+        if self.calibration_frames >= self.MAX_CALIB_FRAMES:
+            n = self.MAX_CALIB_FRAMES
+            self.baseline_pitch  = self._calib_pitch_sum / n
+            self.baseline_yaw    = self._calib_yaw_sum   / n
+            self.baseline_ear    = self._calib_ear_sum   / n
+            self.is_calibrated   = True
+            self.last_blink_time     = time.time()
+            self.last_gaze_move_time = time.time()
 
-                return {
-                    "face_found": True,
-                    "is_calibrated": False,
-                    "calibration_progress": self.calibration_frames,
-                    "status": "CALIBRATING..."
-                }
+        return {
+            "face_found":           True,
+            "is_calibrated":        False,
+            "calibration_progress": self.calibration_frames,
+            "status":               "CALIBRATING",
+            "alarm":                False,
+        }
 
-            # MONITORING PHASE
-            # 1. Blink Detection
-            if (self.baseline_ear - ear) > 0.03:
-                self.last_blink_time = time.time()
+    # ── Monitoring ────────────────────────────────────────────────────────
 
-            # 2. Eye Movement (Gaze Variance)
-            current_gaze_val = (lm[468].x + lm[473].x) / 2.0
-            self.gaze_history.append(current_gaze_val)
-            gaze_variance = np.var(list(self.gaze_history)) * 10000 if len(self.gaze_history) > 10 else 0.0
+    def _monitor(self, lm, w, h) -> dict:
+        now = time.time()
 
-            if gaze_variance > self.GAZE_MOVE_THRESH:
-                self.last_blink_time = time.time()
+        pitch, yaw, _ = self._get_head_pose(lm, w, h)
+        ear = (self._calculate_ear(lm, self.LEFT_EYE) +
+               self._calculate_ear(lm, self.RIGHT_EYE)) / 2.0
 
-            time_since_blink = time.time() - self.last_blink_time
+        # ── SIGNAL 1: Physical blink ──────────────────────────────────────
+        # Only a real eyelid close (EAR drop > 0.03) resets this timer.
+        # Eye movement does NOT reset it — the two signals are independent.
+        if (self.baseline_ear - ear) > self.EAR_BLINK_THRESH:
+            self.last_blink_time = now
+        time_since_blink = now - self.last_blink_time
 
-            # 3. Base Scores
-            delta_pitch = abs(pitch - self.baseline_pitch)
-            delta_yaw = abs(yaw - self.baseline_yaw)
-            delta_ear = self.baseline_ear - ear
+        # ── SIGNAL 2: Iris / eyeball movement ─────────────────────────────
+        # Variance of iris midpoint over a rolling window.
+        # Only meaningful movement (above GAZE_MOVE_THRESH) resets this timer.
+        # Blinking does NOT reset it.
+        iris_mid = (lm[468].x + lm[473].x) / 2.0
+        self.gaze_history.append(iris_mid)
+        gaze_variance = 0.0
+        if len(self.gaze_history) > 10:
+            gaze_variance = float(np.var(list(self.gaze_history)) * 10000)
+        if gaze_variance > self.GAZE_MOVE_THRESH:
+            self.last_gaze_move_time = now
+        time_since_gaze_move = now - self.last_gaze_move_time
 
-            # A. Head Pose Score
-            if delta_pitch < self.PITCH_TOLERANCE and delta_yaw < self.YAW_TOLERANCE:
-                pose_score = 1.0
-            elif delta_pitch < self.PITCH_TOLERANCE*1.5 and delta_yaw < self.YAW_TOLERANCE*1.5:
-                pose_score = 0.5
-            else:
-                pose_score = 0.0
+        # ── STARE ALARM: both signals stale simultaneously ─────────────────
+        # Reading  -> eyes move (gaze timer resets) even if blinks are rare   -> NO alarm
+        # Blinking -> blink timer resets even if gaze is locked               -> NO alarm
+        # Zoning out -> neither blinks NOR moves eyes for 15 s each           -> ALARM
+        stare_alarm = (
+            time_since_blink     > self.BLINK_THRESHOLD and
+            time_since_gaze_move > self.GAZE_STILL_THRESHOLD
+        )
 
-            # B. Eye Openness Score
-            if delta_ear < self.EAR_DROP_THRESH: 
-                eye_score = 1.0 
-            elif delta_ear < self.EAR_DROP_THRESH + 0.05: 
-                eye_score = 0.5 
-            else: 
-                eye_score = 0.0 
+        # ── Base scores ───────────────────────────────────────────────────
+        delta_pitch = abs(pitch - self.baseline_pitch)
+        delta_yaw   = abs(yaw   - self.baseline_yaw)
+        delta_ear   = self.baseline_ear - ear
 
-            # C. Combine Initial Focus Value
-            focus_val = (pose_score * self.W_POSE) + (eye_score * self.W_EYES) + (gaze_score * self.W_GAZE)
+        if delta_pitch < self.PITCH_TOLERANCE and delta_yaw < self.YAW_TOLERANCE:
+            pose_score = 1.0
+        elif delta_pitch < self.PITCH_TOLERANCE * 1.5 and delta_yaw < self.YAW_TOLERANCE * 1.5:
+            pose_score = 0.5
+        else:
+            pose_score = 0.0
 
-            # 4. Sleep Logic (> 15s)
-            if delta_ear > self.EAR_DROP_THRESH:
-                if self.eyes_closed_start_time is None: self.eyes_closed_start_time = time.time()
-                elif (time.time() - self.eyes_closed_start_time) > self.SLEEP_LIMIT:
-                    focus_val, alert_text = 0.0, "WAKE UP!"
-            else: self.eyes_closed_start_time = None
+        if delta_ear < self.EAR_DROP_THRESH:            eye_score = 1.0
+        elif delta_ear < self.EAR_DROP_THRESH + 0.05:  eye_score = 0.5
+        else:                                           eye_score = 0.0
 
-            # 5. Head Down Logic (> 15s)
-            if delta_pitch > self.HEAD_DOWN_THRESH:
-                if self.head_down_start_time is None: self.head_down_start_time = time.time()
-                elif (time.time() - self.head_down_start_time) > 15.0:
-                    focus_val, alert_text = 0.0, "HEAD DOWN ALARM!"
-            else: self.head_down_start_time = None
+        gaze_score = self._get_iris_gaze_score(lm)
 
-            # 6. Stare Logic (> 15s)
-            if time_since_blink > self.BLINK_THRESHOLD:
-                focus_val, alert_text = 0.0, "PLEASE BLINK!"
+        focus_val = (
+            pose_score * self.W_POSE +
+            eye_score  * self.W_EYES +
+            gaze_score * self.W_GAZE
+        )
 
-            # 7. Final Averaging
-            self.focus_history.append(focus_val * 100)
-            avg_focus = sum(self.focus_history) / len(self.focus_history)
+        # ── Override alarms ───────────────────────────────────────────────
+        alarm_reason = None
 
-            if avg_focus > 75: status, alarm_trigger = "FOCUSED", False
-            elif avg_focus > 40: status, alarm_trigger = "DISTRACTED", False # Changed to False to prevent alarm on yellow
-            else:
-                status = alert_text if alert_text else "NOT FOCUSED"
-                alarm_trigger = True
+        if delta_ear > self.EAR_DROP_THRESH:
+            if self.eyes_closed_start_time is None:
+                self.eyes_closed_start_time = now
+            elif (now - self.eyes_closed_start_time) > self.SLEEP_LIMIT:
+                focus_val    = 0.0
+                alarm_reason = "WAKE UP"
+        else:
+            self.eyes_closed_start_time = None
 
-            return {
-                "face_found": True, "is_calibrated": True, "focus_val": int(avg_focus),
-                "status": status, "alarm": alarm_trigger, "blink_timer": int(time_since_blink),
-                "gaze_variance": float(gaze_variance)
-            }
+        if delta_pitch > self.HEAD_DOWN_THRESH:
+            if self.head_down_start_time is None:
+                self.head_down_start_time = now
+            elif (now - self.head_down_start_time) > self.HEAD_DOWN_LIMIT:
+                focus_val    = 0.0
+                alarm_reason = "HEAD DOWN"
+        else:
+            self.head_down_start_time = None
 
-        else: # NO FACE
-            self.eyes_closed_start_time = self.head_down_start_time = None
-            if self.is_calibrated:
-                self.focus_history.append(0.0)
-                avg_focus = sum(self.focus_history) / len(self.focus_history)
-                return {"face_found": False, "is_calibrated": True, "focus_val": int(avg_focus), "status": "NO FACE", "alarm": True}
-            return {"face_found": False, "is_calibrated": False, "status": "NO FACE", "alarm": False}
+        if stare_alarm:
+            focus_val    = 0.0
+            alarm_reason = "PLEASE BLINK"
+
+        # ── Rolling average and final status ──────────────────────────────
+        self.focus_history.append(focus_val * 100)
+        avg_focus = sum(self.focus_history) / len(self.focus_history)
+
+        if avg_focus > 75:
+            status, alarm_trigger = "FOCUSED", False
+        elif avg_focus > 40:
+            status, alarm_trigger = "DISTRACTED", False
+        else:
+            status        = alarm_reason if alarm_reason else "NOT FOCUSED"
+            alarm_trigger = True
+
+        return {
+            "face_found":       True,
+            "is_calibrated":    True,
+            "focus_val":        int(avg_focus),
+            "status":           status,
+            "alarm":            alarm_trigger,
+            "blink_timer":      int(time_since_blink),
+            "gaze_still_timer": int(time_since_gaze_move),
+            "gaze_variance":    round(gaze_variance, 6),
+            "pose_score":       pose_score,
+            "eye_score":        eye_score,
+            "gaze_score":       gaze_score,
+        }
+
+    # ── No face ───────────────────────────────────────────────────────────
+
+    def _no_face_result(self) -> dict:
+        self.eyes_closed_start_time = None
+        self.head_down_start_time   = None
+        if self.is_calibrated:
+            self.focus_history.append(0.0)
+            avg = sum(self.focus_history) / len(self.focus_history)
+            return {"face_found": False, "is_calibrated": True,
+                    "focus_val": int(avg), "status": "NO FACE", "alarm": True}
+        return {"face_found": False, "is_calibrated": False,
+                "calibration_progress": self.calibration_frames,
+                "status": "NO FACE", "alarm": False}
 
     def reset_calibration(self):
-        self.__init__()
+        self._reset_state()

@@ -27,7 +27,7 @@ async def answer_student_question(
         "A student has interrupted you with a question. "
         "You must:\n"
         "1) Answer the question in detail using the EASIEST tone like talking to a lay person. "
-        "The answer should be long enough for a 1-2 minute verbal explanation.\n"
+        "The answer should be concise yet comprehensive, enough for a 45-60 second verbal explanation.\n"
         "2) Provide 3-4 bullet points that summarize your answer for a whiteboard slide.\n"
         "Return STRICT JSON only, no extra commentary:\n"
         "{\n"
