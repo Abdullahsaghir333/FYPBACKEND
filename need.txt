@@ -1,0 +1,397 @@
+=========================================================
+      ACADOMI: REAL-TIME AI TEACHING & FOCUS DETECTION
+=========================================================
+
+1. PYTHON VERSION
+---------------------------------------------------------
+Recommended: Python 3.10 or higher.
+(This codebase uses modern type hinting, async/await features from asyncio, and standard library features that operate best on Python 3.10+)
+
+
+2. SPECIFIC REQUIREMENTS (requirements.txt setup)
+---------------------------------------------------------
+Create your isolated environment and install these requirements. 
+Note: You will use your new Gemini API key in the .env file (`GEMINI_API_KEY=your_new_key`).
+
+# Core Server & Async
+fastapi
+uvicorn
+python-multipart
+pydantic
+python-dotenv
+
+# AI & Prompting (Real-Time AI Teaching)
+langchain
+langchain-community
+langchain-google-genai
+google-generativeai
+
+# Audio & Media (Real-Time AI Teaching)
+gTTS
+pypdf
+
+# Computer Vision (Focus Detection) 
+mediapipe
+opencv-python
+numpy
+
+
+3. HOW SLIDES & EVERYTHING APPEARS (Concept & Flow)
+---------------------------------------------------------
+Only for Real-Time AI Teaching and Focus Detection, the flow is as follows:
+
+A) Document Processing: 
+A user uploads an educational document (PDF, Text). The backend uses `pypdf` to calculate page lengths and passes the binary file to the `gemini-3.1-flash-lite-preview` or `gemini-2.5-flash-lite` models to extract raw text accurately.
+
+B) Slide Content Generation:
+The backend calls the Gemini API to break the text up into logical "Slides". A structured prompt requires Gemini to output valid JSON consisting of an array of slide objects. Each object contains a `title` and a list of bullet `points`.
+
+C) Real-Time AI Teaching (Scripts & Streaming):
+Instead of making the student wait 5 minutes, the AI generates spoken "Scripts" (what the teacher will say) for only the first 6 slides initially. The rest are generated in parallel in the background. 
+When the student navigates to a slide, the Frontend requests audio. The backend converts the script text into speech using `gTTS` and returns it either as an MP3 streaming response or Base64 encoded audio chunks over WebSockets so the audio begins playing instantly while the backend is still processing.
+
+D) Focus Detection Mechanism:
+While the session plays, the student's webcam captures frames. These frames are processed using `MediaPipe FaceMesh`. The pipeline calculates:
+ - Head Pose (Pitch, Yaw): Used to determine if the student is looking away or has their head down.
+ - Eye Aspect Ratio (EAR): Used to measure blinks or sleepiness.
+ - Gaze Variance: Tracks the movement of the iris to make sure the student is continually reading or tracking the screen rather than blindly staring.
+If the student zones out, doesn't blink, or loses focus, a penalty is placed on their focus score and an alarm event triggers.
+
+
+
+4. FULL PYTHON CODE FOR FOCUS DETECTION (Easily Adjustable)
+---------------------------------------------------------
+File: focus_tracker.py
+```python
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+from collections import deque
+
+
+class FocusTracker:
+    # ── Thresholds ────────────────────────────────────────────────────────
+    PITCH_TOLERANCE      = 25.0
+    HEAD_DOWN_THRESH     = 45.0
+    YAW_TOLERANCE        = 20.0
+    EAR_BLINK_THRESH     = 0.03   # EAR drop that counts as a physical blink
+    EAR_DROP_THRESH      = 0.04   # EAR drop used for eye-openness scoring
+    SLEEP_LIMIT          = 15.0   # seconds with eyes closed -> alarm
+    HEAD_DOWN_LIMIT      = 15.0   # seconds with head down -> alarm
+
+    GAZE_MOVE_THRESH     = 0.5
+
+    BLINK_THRESHOLD      = 15.0    # seconds since last physical blink
+    GAZE_STILL_THRESHOLD = 15.0    # seconds since last meaningful iris movement
+
+    # ── Score weights ─────────────────────────────────────────────────────
+    W_POSE = 0.4
+    W_EYES = 0.3
+    W_GAZE = 0.3
+
+    # ── Calibration: 30 frames
+    MAX_CALIB_FRAMES = 30
+
+    # ── Eye landmark indices ──────────────────────────────────────────────
+    LEFT_EYE  = [33,  160, 158, 133, 153, 144]
+    RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self._reset_state()
+
+    def _reset_state(self):
+        self.is_calibrated      = False
+        self.calibration_frames = 0
+        self._calib_pitch_sum   = 0.0
+        self._calib_yaw_sum     = 0.0
+        self._calib_ear_sum     = 0.0
+        self.baseline_pitch     = 0.0
+        self.baseline_yaw       = 0.0
+        self.baseline_ear       = 0.0
+
+        self.last_blink_time     = time.time()
+        self.last_gaze_move_time = time.time()
+
+        self.focus_history = deque(maxlen=20)
+        self.gaze_history  = deque(maxlen=30)
+
+        self.head_down_start_time   = None
+        self.eyes_closed_start_time = None
+
+    def _get_head_pose(self, landmarks, img_w, img_h):
+        face_3d = np.array([
+            [  0.0,   0.0,    0.0],
+            [  0.0, 330.0,  -65.0],
+            [-225.0, -170.0, -135.0],
+            [ 225.0, -170.0, -135.0],
+            [-150.0,  150.0, -125.0],
+            [ 150.0,  150.0, -125.0],
+        ], dtype=np.float64)
+        face_2d = np.array(
+            [[landmarks[i].x * img_w, landmarks[i].y * img_h]
+             for i in [1, 152, 33, 263, 61, 291]],
+            dtype=np.float64,
+        )
+        focal_length = img_w
+        cam_matrix = np.array([
+            [focal_length, 0,            img_h / 2],
+            [0,            focal_length, img_w / 2],
+            [0,            0,            1         ],
+        ])
+        dist_coeffs = np.zeros((4, 1))
+        _, rot_vec, _ = cv2.solvePnP(face_3d, face_2d, cam_matrix, dist_coeffs)
+        rmat, _       = cv2.Rodrigues(rot_vec)
+        angles, *_    = cv2.RQDecomp3x3(rmat)
+        return angles[0], angles[1], angles[2]
+
+    def _calculate_ear(self, landmarks, indices):
+        pts = np.array([[landmarks[i].x, landmarks[i].y] for i in indices])
+        v1 = np.linalg.norm(pts[1] - pts[5])
+        v2 = np.linalg.norm(pts[2] - pts[4])
+        h  = np.linalg.norm(pts[0] - pts[3])
+        return (v1 + v2) / (2.0 * h) if h > 0 else 0.0
+
+    def _get_iris_gaze_score(self, landmarks):
+        L_iris   = landmarks[468].x
+        L_center = (landmarks[33].x  + landmarks[133].x) / 2
+        R_iris   = landmarks[473].x
+        R_center = (landmarks[362].x + landmarks[263].x) / 2
+        avg_dist = (abs(L_iris - L_center) + abs(R_iris - R_center)) / 2
+        if avg_dist < 0.004:   return 1.0
+        elif avg_dist < 0.008: return 0.5
+        else:                  return 0.0
+
+    def process_frame(self, frame: np.ndarray) -> dict:
+        h, w, _ = frame.shape
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+        if not results.multi_face_landmarks:
+            return self._no_face_result()
+        lm = results.multi_face_landmarks[0].landmark
+        return self._calibrate(lm, w, h) if not self.is_calibrated else self._monitor(lm, w, h)
+
+    def _calibrate(self, lm, w, h) -> dict:
+        pitch, yaw, _ = self._get_head_pose(lm, w, h)
+        ear = (self._calculate_ear(lm, self.LEFT_EYE) +
+               self._calculate_ear(lm, self.RIGHT_EYE)) / 2.0
+
+        self.calibration_frames  += 1
+        self._calib_pitch_sum    += pitch
+        self._calib_yaw_sum      += yaw
+        self._calib_ear_sum      += ear
+
+        if self.calibration_frames >= self.MAX_CALIB_FRAMES:
+            n = self.MAX_CALIB_FRAMES
+            self.baseline_pitch  = self._calib_pitch_sum / n
+            self.baseline_yaw    = self._calib_yaw_sum   / n
+            self.baseline_ear    = self._calib_ear_sum   / n
+            self.is_calibrated   = True
+            self.last_blink_time     = time.time()
+            self.last_gaze_move_time = time.time()
+
+        return {"face_found": True, "is_calibrated": self.is_calibrated, "status": "CALIBRATING", "alarm": False}
+
+    def _monitor(self, lm, w, h) -> dict:
+        now = time.time()
+        pitch, yaw, _ = self._get_head_pose(lm, w, h)
+        ear = (self._calculate_ear(lm, self.LEFT_EYE) + self._calculate_ear(lm, self.RIGHT_EYE)) / 2.0
+
+        if (self.baseline_ear - ear) > self.EAR_BLINK_THRESH:
+            self.last_blink_time = now
+        time_since_blink = now - self.last_blink_time
+
+        iris_mid = (lm[468].x + lm[473].x) / 2.0
+        self.gaze_history.append(iris_mid)
+        gaze_variance = float(np.var(list(self.gaze_history)) * 10000) if len(self.gaze_history) > 10 else 0.0
+        
+        if gaze_variance > self.GAZE_MOVE_THRESH:
+            self.last_gaze_move_time = now
+        time_since_gaze_move = now - self.last_gaze_move_time
+
+        stare_alarm = (time_since_blink > self.BLINK_THRESHOLD and time_since_gaze_move > self.GAZE_STILL_THRESHOLD)
+
+        delta_pitch = abs(pitch - self.baseline_pitch)
+        delta_yaw   = abs(yaw   - self.baseline_yaw)
+        delta_ear   = self.baseline_ear - ear
+
+        pose_score = 1.0 if (delta_pitch < self.PITCH_TOLERANCE and delta_yaw < self.YAW_TOLERANCE) else 0.0
+        eye_score = 1.0 if delta_ear < self.EAR_DROP_THRESH else 0.0
+        gaze_score = self._get_iris_gaze_score(lm)
+
+        focus_val = (pose_score * self.W_POSE + eye_score * self.W_EYES + gaze_score * self.W_GAZE)
+        alarm_reason = None
+
+        if delta_ear > self.EAR_DROP_THRESH:
+            if self.eyes_closed_start_time is None: self.eyes_closed_start_time = now
+            elif (now - self.eyes_closed_start_time) > self.SLEEP_LIMIT:
+                focus_val, alarm_reason = 0.0, "WAKE UP"
+        else: self.eyes_closed_start_time = None
+
+        if delta_pitch > self.HEAD_DOWN_THRESH:
+            if self.head_down_start_time is None: self.head_down_start_time = now
+            elif (now - self.head_down_start_time) > self.HEAD_DOWN_LIMIT:
+                focus_val, alarm_reason = 0.0, "HEAD DOWN"
+        else: self.head_down_start_time = None
+
+        if stare_alarm:
+            focus_val, alarm_reason = 0.0, "PLEASE BLINK"
+
+        self.focus_history.append(focus_val * 100)
+        avg_focus = sum(self.focus_history) / len(self.focus_history)
+
+        if alarm_reason:
+            status, alarm_trigger = alarm_reason, True
+            self.focus_history.clear()
+            self.focus_history.append(0.0)
+            avg_focus = 0.0
+        elif avg_focus > 75: status, alarm_trigger = "FOCUSED", False
+        elif avg_focus > 40: status, alarm_trigger = "DISTRACTED", False
+        else: status, alarm_trigger = "NOT FOCUSED", True
+
+        return {"face_found": True, "focus_val": int(avg_focus), "status": status, "alarm": alarm_trigger}
+
+    def _no_face_result(self) -> dict:
+        return {"face_found": False, "status": "NO FACE", "alarm": True}
+```
+
+
+
+5. FULL PYTHON CODE FOR REAL-TIME AI TEACHING 
+---------------------------------------------------------
+File: teaching_ai.py (Combines logic from session generation, prompt handling, caching, and text-to-speech). Requires API Key setup.
+
+```python
+import os
+import json
+import asyncio
+from typing import List, Dict, Any, Tuple
+from pydantic import BaseModel
+from google import genai
+from google.genai import types
+from langchain_google_genai import ChatGoogleGenerativeAI
+from gtts import gTTS
+import base64
+from io import BytesIO
+
+# --- 1) LLM SETUP ---
+# Configure with the new project's key
+API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_NEW_API_KEY_HERE")
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite",
+    api_key=API_KEY,
+    temperature=0.4,
+)
+
+genai_client = genai.Client(api_key=API_KEY)
+
+
+# --- 2) PDF TEXT EXTRACTION ---
+async def extract_text_from_bytes(data: bytes, mime_type: str = "application/pdf") -> str:
+    def _call() -> str:
+        response = genai_client.models.generate_content(
+            model="gemini-3.1-flash-lite-preview",
+            contents=[
+                "Extract ALL text from this file accurately.",
+                types.Part.from_bytes(data=data, mime_type=mime_type),
+            ],
+        )
+        return response.text
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _call)
+
+
+# --- 3) SLIDE GENERATION ---
+async def generate_slides_from_notes(notes_text: str) -> List[Dict[str, Any]]:
+    prompt = (
+        "You are an expert curriculum designer. Break the following text down into "
+        "a structured slide presentation. Output strictly as JSON.\n\n"
+        "Format needed:\n"
+        '[\n  {"title": "Slide Title", "points": ["Bullet 1", "Bullet 2"]}\n]\n\n'
+        f"TEXT:\n{notes_text[:15000]}" # Truncated for safety
+    )
+    
+    response = await llm.ainvoke(prompt)
+    try:
+        # Strip potential markdown formatting from Gemini
+        clean_text = response.content.strip().lstrip('```json').rstrip('```').strip()
+        data = json.loads(clean_text)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print("Failed to parse slides:", e)
+        return []
+
+
+# --- 4) SCRIPT GENERATION (WHAT THE AI SAYS) ---
+async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, Any]]) -> List[str]:
+    scripts = []
+    
+    # Process concurrently for speed (simulating Instant Start behavior)
+    async def process_slide(slide):
+        title = slide.get("title", "")
+        points = ", ".join(slide.get("points", []))
+        
+        prompt = (
+            "You are an engaging teacher. Write what you will SAY out loud for this slide. "
+            "Keep it conversational, insightful, and under 50 words. Do not format with markdown.\n"
+            f"Context: {notes_text[:2000]}\n"
+            f"Slide Title: {title}\n"
+            f"Slide Points: {points}"
+        )
+        resp = await llm.ainvoke(prompt)
+        return resp.content.strip()
+
+    scripts = await asyncio.gather(*[process_slide(s) for s in slides])
+    return scripts
+
+
+# --- 5) TEXT-TO-SPEECH (AUDIO STREAMING) ---
+async def stream_script_audio_base64(script: str, chunk_size: int = 4096):
+    def _synthesize() -> bytes:
+        buf = BytesIO()
+        tts = gTTS(text=script, lang="en", slow=False)
+        tts.write_to_fp(buf)
+        return buf.getvalue()
+
+    loop = asyncio.get_event_loop()
+    audio_bytes = await loop.run_in_executor(None, _synthesize)
+    
+    chunks = []
+    for i in range(0, len(audio_bytes), chunk_size):
+        chunk_b64 = base64.b64encode(audio_bytes[i : i + chunk_size]).decode("utf-8")
+        chunks.append(chunk_b64)
+    return chunks
+
+
+# --- 6) REAL-TIME QUESTION RESPONDER (Q&A Loop) ---
+async def answer_student_question(question: str, slide_context: str) -> dict:
+    prompt = (
+        "You are a teacher answering a question mid-lecture. Be brief and to the point.\n"
+        f"Context: {slide_context}\n"
+        f"Student Question: {question}\n\n"
+        "Provide your answer as JSON formatted with 'detail_ans'."
+    )
+    
+    try:
+        response = await llm.ainvoke(prompt)
+        clean_text = response.content.strip().lstrip('```json').rstrip('```').strip()
+        result = json.loads(clean_text)
+        return result
+    except:
+        return {"detail_ans": "That's a good question. Let's research that more."}
+
+# Example orchestration:
+# 1. extracted_text = await extract_text_from_bytes(pdf_bytes)
+# 2. slides = await generate_slides_from_notes(extracted_text)
+# 3. scripts = await generate_scripts_for_slides(extracted_text, slides)
+# 4. For answering a question directly during the slide: await answer_student_question("Why?", slides[0])
+```

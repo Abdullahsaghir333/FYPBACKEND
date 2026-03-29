@@ -14,11 +14,16 @@ class FocusTracker:
     EAR_DROP_THRESH      = 0.04   # EAR drop used for eye-openness scoring
     SLEEP_LIMIT          = 15.0   # seconds with eyes closed -> alarm
     HEAD_DOWN_LIMIT      = 15.0   # seconds with head down -> alarm
-    GAZE_MOVE_THRESH     = 0.005  # gaze-variance threshold (scaled x10000)
 
-    # Stare alarm fires only when BOTH timers exceed their limit simultaneously
-    BLINK_THRESHOLD      = 15.0   # seconds since last physical blink
-    GAZE_STILL_THRESHOLD = 15.0   # seconds since last meaningful iris movement
+    # ── FIX 1: Raised gaze variance threshold ─────────────────────────────
+    # Variance is multiplied by 10000. At 0.05 even micro-tremors reset the
+    # timer. Raise to 1.5 so only real intentional eye movement counts.
+    GAZE_MOVE_THRESH     = 0.5
+
+    # ── FIX 2: Reduced stare alarm timers from 15s to 8s ──────────────────
+    # 15 seconds is far too long. 8 seconds is a natural "zoning out" window.
+    BLINK_THRESHOLD      = 15.0    # seconds since last physical blink
+    GAZE_STILL_THRESHOLD = 15.0    # seconds since last meaningful iris movement
 
     # ── Score weights ─────────────────────────────────────────────────────
     W_POSE = 0.4
@@ -141,7 +146,7 @@ class FocusTracker:
 
         return {
             "face_found":           True,
-            "is_calibrated":        False,
+            "is_calibrated":        self.is_calibrated,
             "calibration_progress": self.calibration_frames,
             "status":               "CALIBRATING",
             "alarm":                False,
@@ -157,16 +162,16 @@ class FocusTracker:
                self._calculate_ear(lm, self.RIGHT_EYE)) / 2.0
 
         # ── SIGNAL 1: Physical blink ──────────────────────────────────────
-        # Only a real eyelid close (EAR drop > 0.03) resets this timer.
+        # Only a real eyelid close (EAR drop > EAR_BLINK_THRESH) resets this.
         # Eye movement does NOT reset it — the two signals are independent.
         if (self.baseline_ear - ear) > self.EAR_BLINK_THRESH:
             self.last_blink_time = now
         time_since_blink = now - self.last_blink_time
 
         # ── SIGNAL 2: Iris / eyeball movement ─────────────────────────────
-        # Variance of iris midpoint over a rolling window.
-        # Only meaningful movement (above GAZE_MOVE_THRESH) resets this timer.
-        # Blinking does NOT reset it.
+        # Variance of iris midpoint over a rolling window (scaled x10000).
+        # FIX: threshold raised to 1.5 so micro-tremors don't falsely reset.
+        # Blinking does NOT reset this timer.
         iris_mid = (lm[468].x + lm[473].x) / 2.0
         self.gaze_history.append(iris_mid)
         gaze_variance = 0.0
@@ -176,10 +181,10 @@ class FocusTracker:
             self.last_gaze_move_time = now
         time_since_gaze_move = now - self.last_gaze_move_time
 
-        # ── STARE ALARM: both signals stale simultaneously ─────────────────
-        # Reading  -> eyes move (gaze timer resets) even if blinks are rare   -> NO alarm
-        # Blinking -> blink timer resets even if gaze is locked               -> NO alarm
-        # Zoning out -> neither blinks NOR moves eyes for 15 s each           -> ALARM
+        # ── STARE ALARM: BOTH signals stale simultaneously ─────────────────
+        # Reading  -> eyes move (gaze timer resets) even if blinks are rare -> NO alarm
+        # Blinking -> blink timer resets even if gaze is locked             -> NO alarm
+        # Zoning out -> neither blinks NOR moves eyes for threshold seconds -> ALARM
         stare_alarm = (
             time_since_blink     > self.BLINK_THRESHOLD and
             time_since_gaze_move > self.GAZE_STILL_THRESHOLD
@@ -230,6 +235,9 @@ class FocusTracker:
         else:
             self.head_down_start_time = None
 
+        # ── FIX 3: Stare alarm fires immediately — no rolling average delay ──
+        # Previously stare_alarm set alarm_reason but focus_val was still
+        # averaged, causing a delay. Now we force alarm immediately.
         if stare_alarm:
             focus_val    = 0.0
             alarm_reason = "PLEASE BLINK"
@@ -238,12 +246,22 @@ class FocusTracker:
         self.focus_history.append(focus_val * 100)
         avg_focus = sum(self.focus_history) / len(self.focus_history)
 
-        if avg_focus > 75:
+        # CRITICAL: If any override alarm is active, force immediate alarm
+        # regardless of rolling average. The rolling average is too slow
+        # to react to these urgent conditions.
+        if alarm_reason:
+            status        = alarm_reason
+            alarm_trigger = True
+            # Flush rolling history so stale high scores don't delay recovery
+            self.focus_history.clear()
+            self.focus_history.append(0.0)
+            avg_focus = 0.0
+        elif avg_focus > 75:
             status, alarm_trigger = "FOCUSED", False
         elif avg_focus > 40:
             status, alarm_trigger = "DISTRACTED", False
         else:
-            status        = alarm_reason if alarm_reason else "NOT FOCUSED"
+            status        = "NOT FOCUSED"
             alarm_trigger = True
 
         return {

@@ -255,6 +255,8 @@ async def extract_text_from_upload(file: UploadFile) -> Tuple[str, Optional[int]
 
     # if extractor returned an error message, pass it through
     if isinstance(text, str) and text.startswith("Extraction Error"):
+        if "429" in text or "RESOURCE_EXHAUSTED" in text:
+            raise HTTPException(status_code=429, detail="AI Provider Rate Limit Exceeded. Please wait a minute and try again.")
         raise HTTPException(status_code=500, detail=text)
 
     # clean up text with LLM
@@ -320,6 +322,8 @@ async def extract_text_from_bytes_upload(
         raise HTTPException(status_code=400, detail="Uploaded file appears to be empty or non-text.")
 
     if isinstance(text, str) and text.startswith("Extraction Error"):
+        if "429" in text or "RESOURCE_EXHAUSTED" in text:
+            raise HTTPException(status_code=429, detail="AI Provider Rate Limit Exceeded. Please wait a minute and try again.")
         raise HTTPException(status_code=500, detail=text)
 
     system = (
@@ -379,9 +383,9 @@ async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, An
         "You are an experienced teacher giving a spoken explanation.\n"
         "For each slide, produce a short script (max ~200 words) that a teacher would say while presenting it.\n"
         "The scripts should be concise and to the point.\n"
-        "Follow a teacher style explaining in layman language and use simple examples.\n"
-        "When relevant, include a concrete real-world example or mini use-case for the concept.\n"
-        "Use approachable language, examples, and small checkpoints like “pause and think for a second”.\n"
+        "Follow a teacher style explaining in layman language.\n"
+        "ALWAYS try to use concrete, real-world examples to explain the points whenever applicable.\n"
+        "Use approachable language, relatable examples, and small checkpoints like “pause and think for a second”.\n"
         "Return STRICT JSON with this exact structure:\n"
         "{\n"
         '  \"scripts\": [\"script for slide 1\", \"script for slide 2\", ...]\n'
@@ -458,9 +462,9 @@ async def generate_notes_from_bookmarks(
         "Rules:\n"
         "- `importantPoints` MUST be derived from bookmarks (rewrite/merge/dedupe them).\n"
         "- Keep `keyPoints` concise (max 20).\n"
-        "- `topicNotes`: 5-12 topics, each 3-6 sentences.\n"
-        "- `cheatsheet`: 8-15 items, concise and exam-ready.\n"
-        "- `cheatsheet` MUST be generated independently from the source notes and key concepts; do NOT copy/reformat `topicNotes` entries.\n"
+        "- `topicNotes`: DO NOT just regurgitate bullet points. Write 5-12 comprehensive topics. For EACH topic, you MUST explain the concept clearly and then provide a concrete, easy-to-understand REAL-WORLD EXAMPLE.\n"
+        "- `cheatsheet`: 8-15 items, concise and exam-ready. You MUST include terms and definitions derived closely from the student's BOOKMARKS as the highest priority items in this list.\n"
+        "- `cheatsheet` MUST be completely different from `topicNotes` and must ONLY contain short definitions/formulas, not paragraphs.\n"
         "- No extra text outside JSON."
     )
 

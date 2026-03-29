@@ -372,3 +372,28 @@ async def play_slide_audio(session_id: str, slide_id: int) -> dict:
     asyncio.create_task(_broadcast())
     return {"status": "started", "slide_id": slide_id}
 
+@router.post(
+    "/{session_id}/notes/generate",
+    summary="Generate comprehensive AI notes for a session including bookmarks"
+)
+async def generate_notes(session_id: str, payload: dict):
+    state = get_session(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found.")
+        
+    from app.services.notes_pipeline import generate_notes_from_bookmarks
+    
+    bookmarks = payload.get("bookmarks", [])
+    
+    try:
+        notes_json = await generate_notes_from_bookmarks(
+            notes_text=state.notes_text,
+            slides=[s.model_dump() for s in state.slides],
+            bookmarks=bookmarks
+        )
+        return notes_json
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+

@@ -53,7 +53,7 @@ async def extract_text_from_bytes(data: bytes, mime_type: str) -> Tuple[str, Opt
         client = get_genai_client()
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-3.1-flash-lite-preview",
                 contents=[
                     f"Extract ALL text from this file (mime type {mime_type}) accurately.",
                     types.Part.from_bytes(data=data, mime_type=mime_type),
