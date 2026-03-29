@@ -123,3 +123,5 @@ yarn-error.log*
 *.njsproj
 *.sln
 *.sw?
+".env" 
+"a.py" 
