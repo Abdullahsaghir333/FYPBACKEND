@@ -378,9 +378,27 @@ async def generate_slides_from_notes(notes_text: str, page_count: Optional[int] 
     return slides
 
 
-async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, Any]]) -> List[str]:
+async def generate_scripts_for_slides(notes_text: str, slides: List[Dict[str, Any]], difficulty: str = 'medium') -> List[str]:
+    # Build difficulty-aware prompt modifier
+    difficulty_modifier = ""
+    if difficulty == 'easy':
+        difficulty_modifier = (
+            "IMPORTANT: The student has selected EASY difficulty. "
+            "Explain like you're talking to a high school student. "
+            "Use very simple language, lots of analogies, and real-world examples. "
+            "Avoid jargon. Keep sentences short.\n"
+        )
+    elif difficulty == 'hard':
+        difficulty_modifier = (
+            "IMPORTANT: The student has selected HARD difficulty. "
+            "Explain at a university/graduate level. "
+            "Use precise technical vocabulary, include formal definitions, "
+            "and reference theoretical frameworks where applicable.\n"
+        )
+
     system = (
         "You are an experienced teacher giving a spoken explanation.\n"
+        f"{difficulty_modifier}"
         "For each slide, produce a short script (max ~200 words) that a teacher would say while presenting it.\n"
         "The scripts should be concise and to the point.\n"
         "Follow a teacher style explaining in layman language.\n"

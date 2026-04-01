@@ -1,48 +1,35 @@
-"""Text-to-Speech service using gTTS (lightweight Google TTS) for audio generation.
+"""Text-to-Speech service using edge-tts (high-quality Microsoft Azure neural voices) for audio generation.
 
-This implementation replaces the previous Google Cloud TTS client with the
-`gTTS` package. It synthesizes MP3 audio into memory and returns bytes. To
-keep the existing async API, the blocking gTTS calls are executed in a
-ThreadPoolExecutor.
+This implementation uses `edge-tts` to synthesize MP3 audio into memory natively with asyncio.
+It provides extremely realistic and expressive voices 100% free of charge.
 """
 import os
 from typing import AsyncGenerator, Optional
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from gtts import gTTS
+import edge_tts
 from io import BytesIO
 import base64
 
-_executor = ThreadPoolExecutor(max_workers=4)
-
+async def _synthesize_edge_tts(text: str, voice_id: str) -> bytes:
+    communicate = edge_tts.Communicate(text, voice_id)
+    buf = BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    return buf.getvalue()
 
 async def convert_text_to_speech(
     text: str,
     language_code: str = "en-US",
-    voice_name: str = "en-US-Neural2-A",
+    # Using ChristopherNeural as the default expressive, joyful male voice
+    voice_name: str = "en-US-ChristopherNeural", 
     speak_rate: float = 1.0,
 ) -> bytes:
-    """Convert text to speech using gTTS and return MP3 bytes.
-
-    Notes:
-    - `gTTS` uses the short language code (e.g. 'en'). If a regional code is
-      provided (e.g. 'en-US'), we use the base language.
-    - `gTTS` does not support custom voice selection or speaking rate; those
-      parameters are accepted for API compatibility but ignored.
-    """
+    """Convert text to speech using edge-tts and return MP3 bytes."""
     if not text or not text.strip():
         return b""
 
-    lang = language_code.split("-")[0] if language_code else "en"
-
-    def _synthesize() -> bytes:
-        buf = BytesIO()
-        tts = gTTS(text=text, lang=lang, slow=False)
-        tts.write_to_fp(buf)
-        return buf.getvalue()
-
-    loop = asyncio.get_event_loop()
-    audio_bytes = await loop.run_in_executor(_executor, _synthesize)
+    audio_bytes = await _synthesize_edge_tts(text, voice_name)
     return audio_bytes
 
 
@@ -50,7 +37,7 @@ async def convert_scripts_to_audio(
     scripts: list[str],
     chunk_size: int = 4096,
     language_code: str = "en-US",
-    voice_name: str = "en-US-Neural2-A",
+    voice_name: str = "en-US-ChristopherNeural",
 ) -> list[dict]:
     """Convert multiple scripts to audio and return metadata with audio data."""
     results = []
@@ -81,7 +68,7 @@ async def stream_script_audio(
     script: str,
     chunk_size: int = 4096,
     language_code: str = "en-US",
-    voice_name: str = "en-US-Neural2-A",
+    voice_name: str = "en-US-ChristopherNeural",
 ) -> AsyncGenerator[bytes, None]:
     """Stream script as audio chunks (yields raw MP3 bytes)."""
     audio_bytes = await convert_text_to_speech(
@@ -98,7 +85,7 @@ async def stream_script_audio_base64(
     script: str,
     chunk_size: int = 4096,
     language_code: str = "en-US",
-    voice_name: str = "en-US-Neural2-A",
+    voice_name: str = "en-US-ChristopherNeural",
 ) -> AsyncGenerator[str, None]:
     """Stream script as base64-encoded audio chunks (safe for JSON/WebSocket)."""
     async for chunk in stream_script_audio(
@@ -109,10 +96,6 @@ async def stream_script_audio_base64(
     ):
         yield base64.b64encode(chunk).decode("utf-8")
 
-
-# Note: gTTS uses language codes (e.g. 'en', 'en-uk'). We keep a simple map
-# for compatibility, but voice selection is not available with gTTS.
 AVAILABLE_VOICES = {
-    "en-US": ["default"],
-    "en-GB": ["default"],
+    "en-US": ["en-US-ChristopherNeural", "en-US-EricNeural", "en-US-SteffanNeural"],
 }

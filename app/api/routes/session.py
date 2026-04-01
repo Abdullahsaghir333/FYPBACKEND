@@ -1,7 +1,7 @@
 import uuid
 from typing import List, Dict, Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, BackgroundTasks
+from fastapi import APIRouter, File, HTTPException, UploadFile, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 
 from app.models import QuestionRequest, QuestionResponse, SessionState, Slide, SlidePoint
@@ -27,7 +27,7 @@ from app.services.realtime import (
 import asyncio
 
 
-async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slide_dicts: List[Dict[str, Any]]):
+async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slide_dicts: List[Dict[str, Any]], difficulty: str = 'medium'):
     """Background task to generate scripts for slides > 6."""
     state = get_session(session_id)
     if not state:
@@ -40,7 +40,7 @@ async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slid
         for attempt in range(max_retries):
             try:
                 print(f"Background: generating scripts for slides {i} to {i+len(chunk)-1} (Attempt {attempt+1}/{max_retries})...")
-                chunk_scripts = await generate_scripts_for_slides(notes_text, chunk)
+                chunk_scripts = await generate_scripts_for_slides(notes_text, chunk, difficulty)
                 
                 # Update the session state slides
                 for j, script in enumerate(chunk_scripts):
@@ -64,8 +64,31 @@ async def _generate_remaining_scripts(session_id: str, notes_text: str, all_slid
 router = APIRouter()
 
 
+# ── Difficulty-aware script prompt modifier ──
+def _difficulty_prompt_modifier(difficulty: str) -> str:
+    if difficulty == 'easy':
+        return (
+            "IMPORTANT: The student has selected EASY difficulty. "
+            "Explain like you're talking to a high school student. "
+            "Use very simple language, lots of analogies, and real-world examples. "
+            "Avoid jargon. Keep sentences short.\n"
+        )
+    elif difficulty == 'hard':
+        return (
+            "IMPORTANT: The student has selected HARD difficulty. "
+            "Explain at a university/graduate level. "
+            "Use precise technical vocabulary, include formal definitions, "
+            "and reference theoretical frameworks where applicable.\n"
+        )
+    return ""  # medium = default behavior
+
+
 @router.post("", response_model=SessionState, summary="Create a new teaching session from uploaded notes")
-async def create_session(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> SessionState:
+async def create_session(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    difficulty: str = Query(default='medium', regex='^(easy|medium|hard)$'),
+) -> SessionState:
     if file.size is not None and file.size == 0:
         raise HTTPException(status_code=400, detail="Empty file uploaded.")
 
@@ -92,7 +115,7 @@ async def create_session(background_tasks: BackgroundTasks, file: UploadFile = F
     first_chunk_dicts = slide_dicts[:chunk_size]
 
     try:
-        first_scripts = await generate_scripts_for_slides(notes_text, first_chunk_dicts)
+        first_scripts = await generate_scripts_for_slides(notes_text, first_chunk_dicts, difficulty)
         print(f"create_session: initial scripts generated ({len(first_scripts)})")
     except Exception as e:
         # Do not fail entire session on transient Gemini load spikes.
@@ -126,12 +149,12 @@ async def create_session(background_tasks: BackgroundTasks, file: UploadFile = F
         slides.append(slide)
 
     session_id = str(uuid.uuid4())
-    state = SessionState(id=session_id, notes_text=notes_text, slides=slides)
+    state = SessionState(id=session_id, notes_text=notes_text, slides=slides, difficulty=difficulty)
     save_session(state)
 
     # If there are more slides than the first chunk, launch the background task
     if len(slide_dicts) > chunk_size:
-        background_tasks.add_task(_generate_remaining_scripts, session_id, notes_text, slide_dicts)
+        background_tasks.add_task(_generate_remaining_scripts, session_id, notes_text, slide_dicts, difficulty)
 
     return state
 
@@ -396,4 +419,67 @@ async def generate_notes(session_id: str, payload: dict):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/{session_id}/restore",
+    response_model=SessionState,
+    summary="Restore a session from Node.js DB data into Python memory",
+)
+async def restore_session(session_id: str, payload: dict) -> SessionState:
+    """Rehydrate a session into Python in-memory store from MongoDB-persisted data.
+    
+    This allows sessions to survive Python server restarts. The frontend calls this
+    when it gets a 404 from GET /session/{id} — it fetches the data from Node.js DB
+    and sends it here to reconstruct the session.
+    """
+    # Check if already in memory
+    existing = get_session(session_id)
+    if existing:
+        return existing
+    
+    notes_text = payload.get('notes_text', '')
+    slides_raw = payload.get('slides', [])
+    difficulty = payload.get('difficulty', 'medium')
+    
+    if not slides_raw:
+        raise HTTPException(status_code=400, detail="No slides data provided for restore.")
+    
+    # Reconstruct Slide objects from raw JSON
+    slides: List[Slide] = []
+    for idx, s in enumerate(slides_raw):
+        if not isinstance(s, dict):
+            continue
+        title = s.get('title') or f'Slide {idx + 1}'
+        raw_points = s.get('points') or []
+        points = []
+        for p in raw_points:
+            if isinstance(p, dict):
+                points.append(SlidePoint(text=str(p.get('text', ''))))
+            elif isinstance(p, str):
+                points.append(SlidePoint(text=p))
+        
+        script = s.get('script', '')
+        point_timings = s.get('point_timings', [])
+        
+        slide = Slide(
+            id=s.get('id', idx),
+            title=title,
+            points=points,
+            script=script,
+            point_timings=point_timings,
+            audio_data=None,   # audio will be regenerated on-demand
+            audio_chunks=None,
+        )
+        slides.append(slide)
+    
+    state = SessionState(
+        id=session_id,
+        notes_text=notes_text,
+        slides=slides,
+        difficulty=difficulty,
+    )
+    save_session(state)
+    print(f"[restore_session] Restored session {session_id} with {len(slides)} slides")
+    return state
 
